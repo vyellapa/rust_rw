@@ -1,0 +1,2704 @@
+#ifndef MERGE_H
+#define MERGE_H
+
+#define BOOST_UUID_RANDOM_PROVIDER_FORCE_POSIX
+
+#include <iostream>
+#include <fstream>
+#include <tuple>
+#include <boost/unordered_map.hpp>
+#include <boost/graph/adjacency_list.hpp>
+#include <boost/graph/connected_components.hpp>
+#include <boost/program_options/cmdline.hpp>
+#include <boost/program_options/options_description.hpp>
+#include <boost/program_options/parsers.hpp>
+#include <boost/program_options/variables_map.hpp>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/date_time/gregorian/gregorian.hpp>
+#include <boost/iostreams/stream.hpp>
+#include <boost/iostreams/stream_buffer.hpp>
+#include <boost/iostreams/device/file.hpp>
+#include <boost/iostreams/filtering_stream.hpp>
+#include <boost/iostreams/filter/zlib.hpp>
+#include <boost/iostreams/filter/gzip.hpp>
+#include <boost/icl/interval_map.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/tokenizer.hpp>
+#include <htslib/sam.h>
+#include <htslib/vcf.h>
+#include <htslib/faidx.h>
+
+#include "tags.h"
+#include "version.h"
+#include "util.h"
+#include "edlib.h"
+#include "modvcf.h"
+#include "svanno.h"
+#include "tandem.h"
+
+
+namespace torali
+{
+
+
+  struct MergeConfig {
+    bool filterForPass;
+    bool filterForPrecise;
+    bool cnvMode;
+    bool hasGenome;
+    bool longread;
+    bool chunkMerge;
+    bool annotated;
+    uint32_t chunksize;
+    uint32_t svcounter;
+    uint32_t alleleCounter;
+    uint32_t bpoffset;
+    uint32_t minsize;
+    uint32_t maxsize;
+    uint32_t coverage;
+    uint32_t totalSamples;
+    int32_t qualthres;
+    float recoverlap;
+    float vaf;
+    // SV subtypes
+    int32_t meiOffset;
+    float meiSizeRatio;
+    float meiSeqId;
+    int32_t trOffset;
+    float trFrac;
+    float trSeqId;
+    float normFrac;
+    float juncSeqId;
+    int32_t seqCutoff;
+    int32_t recurrentSamples;
+    float repMinAF;
+    int32_t trLenTol;
+    float trLenFrac;
+    int32_t cnvLargeSize;
+    float cnvMinUniq;
+    float cnvGainUniq;
+    int32_t cnvMinWindows;
+    int32_t cnvMinCarriers;
+    boost::filesystem::path outfile;
+    boost::filesystem::path genome;
+    std::vector<boost::filesystem::path> files;
+  };
+
+
+  template<typename TPos>
+  double recOverlap(TPos const s1, TPos const e1, TPos const s2, TPos const e2) {
+    if ((e1 < s2) || (s1 > e2)) return 0;
+    double lenA = (double) (e1-s1);
+    if (lenA <= 0) return 0;
+    double lenB = (double) (e2-s2);
+    if (lenB <= 0) return 0;
+    double overlapLen = double(std::min(e1, e2) - std::max(s1, s2));
+    if (overlapLen <= 0) return 0;
+    return (overlapLen / std::max(lenA, lenB));
+  }
+
+
+  struct MergeSV {
+    int32_t tid;
+    int32_t mtid;
+    int32_t svStart;
+    int32_t svEnd;     // INS: svStart + size for overlap
+    int32_t pos2;
+    int32_t size;
+    int32_t svt;
+    int32_t homlen;
+    int32_t trperiod;
+    int32_t score;
+    int32_t fileIdx;
+    int32_t supp;
+    int32_t ac;
+    int32_t sr;
+    int32_t srmapq;
+    int32_t altSupport;
+    int8_t subtype;   // 0:none 1:ALU 2:LINE1 3:SVA 4:NUMT 5:LTR 6:HERVK 7:TR
+    int8_t insStrand; // -1:NA 0:+ 1:-
+    int8_t hap;
+    bool precise;
+    bool fromSiteList; // chunk re-merge
+    float srq;
+    float ce;
+    int32_t comp;      
+    int32_t trStart;
+    int32_t trEnd;
+    std::string id;
+    std::string seq;
+  };
+
+  struct MergeAgg {
+    int32_t ac;
+    int32_t an;
+    int32_t supp;
+    int32_t ciposLo;
+    int32_t ciposHi;
+    int32_t ciendLo;
+    int32_t ciendHi;
+    uint32_t alleleId;
+    int32_t nAllele;
+    int32_t trStart;
+    int32_t trEnd;
+  };
+
+  // One merged allele
+  struct AlleleGroup {
+    int32_t rep;
+    std::vector<int32_t> members;
+    MergeAgg agg;
+  };
+
+
+  inline int8_t
+  _subtypeCode(std::string const& s) {
+    // 0:none 1:ALU 2:LINE1 3:SVA 4:NUMT 5:LTR 6:HERVK 7:TR
+    if (s.find("ME:ALU") != std::string::npos) return 1;
+    if (s.find("ME:LINE1") != std::string::npos) return 2;
+    if (s.find("ME:SVA") != std::string::npos) return 3;
+    if (s.find("NUMT") != std::string::npos) return 4;
+    if (s.find("LTR") != std::string::npos) return 5;
+    if (s.find("HERVK") != std::string::npos) return 6;
+    if (s.find("TR") != std::string::npos) return 7;
+    return 0;
+  }
+
+  inline int32_t
+  _mergeDecodeSVT(std::string const& svt, bool const hasCT, std::string const& ct) {
+    if (hasCT) return _decodeOrientation(ct, svt);
+    // Fallback for other SV callers
+    if (svt == "DEL") return 2;
+    else if (svt == "INS") return 4;
+    else if (svt.compare(0, 3, "DUP") == 0) return 3; 
+    else if (svt.compare(0, 3, "INV") == 0) return 0;
+    else if (svt == "CNV") return 9;
+    else if ((svt == "BND") || (svt == "TRA")) return DELLY_SVT_TRANS + 0;
+    return -1;
+  }
+
+  inline bool
+  _parseBndMate(std::string const& alt, std::string& chr2, int32_t& pos2) {
+    std::size_t lb = alt.find_first_of("[]");
+    if (lb == std::string::npos) return false;
+    char br = alt[lb];
+    std::size_t rb = alt.find(br, lb + 1);
+    if (rb == std::string::npos) return false;
+    std::string loc = alt.substr(lb + 1, rb - lb - 1);
+    std::size_t colon = loc.rfind(':');
+    if (colon == std::string::npos) return false;
+    chr2 = loc.substr(0, colon);
+    try {
+      pos2 = boost::lexical_cast<int32_t>(loc.substr(colon + 1));
+    } catch (...) {
+      return false;
+    }
+    return true;
+  }
+
+  inline std::string
+  _minRotation(std::string const& s) {
+    if (s.size() < 2) return s;
+    std::string dbl = s + s;
+    int32_t n = (int32_t) dbl.size();
+    std::vector<int32_t> f(n, -1);
+    int32_t k = 0;
+    for(int32_t j = 1; j < n; ++j) {
+      char sj = dbl[j];
+      int32_t i = f[j - k - 1];
+      while ((i != -1) && (sj != dbl[k + i + 1])) {
+	if (sj < dbl[k + i + 1]) k = j - i - 1;
+	i = f[i];
+      }
+      if (sj != dbl[k + i + 1]) {
+	if (sj < dbl[k]) k = j; 
+	f[j - k] = -1;
+      } else f[j - k] = i + 1;
+    }
+    return dbl.substr(k, s.size());
+  }
+
+  inline double
+  _seqIdentity(std::string const& a, std::string const& b, double const minId) {
+    if ((a.empty()) || (b.empty())) return -1.0;
+    int32_t maxlen = (int32_t) std::max(a.size(), b.size());
+    if (maxlen == 0) return 1.0;
+    int32_t k = -1;
+    if ((minId > 0.0) && (minId < 1.0)) k = (int32_t) ((1.0 - minId) * maxlen);
+    EdlibAlignResult align = edlibAlign(a.c_str(), a.size(), b.c_str(), b.size(), edlibNewAlignConfig(k, EDLIB_MODE_NW, EDLIB_TASK_DISTANCE, NULL, 0));
+    double id;
+    if (align.editDistance >= 0) id = 1.0 - (double) align.editDistance / (double) maxlen;
+    else id = (k >= 0) ? 0.0 : -1.0;
+    edlibFreeAlignResult(align);
+    return id;
+  }
+
+  // Sequence identity
+  inline double
+  _bestSeqIdentity(std::string const& a, std::string const& b, int32_t const posOff, double const minId, int32_t const seqCutoff) {
+    if ((a.empty()) || (b.empty())) return -1.0;
+    double best = _seqIdentity(a, b, minId);
+    // Found hit?
+    if ((minId > 0.0) && (best >= minId)) return best;
+    // Exact REF/ALT up to seqCutoff
+    if (((int32_t) a.size() < seqCutoff) && ((int32_t) b.size() < seqCutoff)) {
+      int32_t f = posOff % (int32_t) b.size();
+      if (f > 0) {
+	std::string rot = b.substr(b.size() - f) + b.substr(0, b.size() - f);
+	best = std::max(best, _seqIdentity(a, rot, minId));
+	if ((minId > 0.0) && (best >= minId)) return best;
+      }
+      best = std::max(best, _seqIdentity(_minRotation(a), _minRotation(b), minId));
+    }
+    return best;
+  }
+
+  // SV matching based on SV subtypes
+  inline bool
+  _svMatch(MergeConfig const& c, MergeSV const& a, MergeSV const& b) {
+    // Translocations (BND)
+    if (_translocation(a.svt)) {
+      if (a.mtid != b.mtid) return false;
+      int32_t win = std::max((int32_t) c.bpoffset, std::max(a.homlen, b.homlen));
+      if (std::abs(a.svStart - b.svStart) > win) return false;
+      if (std::abs(a.pos2 - b.pos2) > win) return false;
+      // Junction-consensus check
+      if ((!a.seq.empty()) && (!b.seq.empty()) && ((int32_t) std::max(a.seq.size(), b.seq.size()) < c.seqCutoff)) {
+	double sid = _seqIdentity(a.seq, b.seq, c.juncSeqId);
+	if ((sid >= 0) && (sid < c.juncSeqId)) return false;
+      }
+      return true;
+    }
+
+    // Other SVs
+    int32_t posOff = std::abs(a.svStart - b.svStart);
+    int32_t maxHom = std::max(a.homlen, b.homlen);
+    double minS = (double) std::min(a.size, b.size);
+    double maxS = (double) std::max(a.size, b.size);
+    double sizeRatio = (maxS > 0) ? (minS / maxS) : 1.0;
+    int8_t st = a.subtype ? a.subtype : b.subtype;
+    if ((a.subtype) && (b.subtype) && (a.subtype != b.subtype)) st = std::min(a.subtype, b.subtype);
+
+    // Merge according to SV subtype
+    if ((st >= 1) && (st <= 6)) {
+      // MEI, NUMT, LTR, HERVK
+      if ((a.insStrand >= 0) && (b.insStrand >= 0) && (a.insStrand != b.insStrand)) return false;
+      int32_t win = std::max(c.meiOffset, maxHom + 10);
+      if (posOff > win) return false;
+      if (sizeRatio < c.meiSizeRatio) return false;
+      if ((!a.seq.empty()) && (!b.seq.empty()) && (maxS < c.seqCutoff)) {
+	double sid = _bestSeqIdentity(a.seq, b.seq, posOff, c.meiSeqId, c.seqCutoff);
+	if ((sid >= 0) && (sid < c.meiSeqId)) return false;
+      }
+      return true;
+    } else if (st == 7) {
+      // Tandem repeats
+      int32_t win = std::max(c.trOffset, (int32_t) (c.trFrac * maxS));
+      if (a.trperiod > 0) win = std::max(win, 2 * a.trperiod);
+      if (b.trperiod > 0) win = std::max(win, 2 * b.trperiod);
+      if (posOff > win) return false;
+      if ((!a.seq.empty()) && (!b.seq.empty()) && (maxS < c.seqCutoff)) {
+	double sid = _bestSeqIdentity(a.seq, b.seq, posOff, c.trSeqId, c.seqCutoff);
+	if ((sid >= 0) && (sid < c.trSeqId)) return false;
+      }
+      return true;
+    } else {
+      // Left-over SVs
+      int32_t win = std::min((int32_t) c.bpoffset, (int32_t) (c.normFrac * maxS));
+      if (win < 50) win = 50; // Min. offset
+      if (win < maxHom) win = maxHom;
+      if (posOff > win) return false;
+      if (recOverlap(a.svStart, a.svEnd, b.svStart, b.svEnd) < c.recoverlap) return false;
+      if ((a.svt == 4) && (sizeRatio < 0.7)) return false;
+      // Junction-consensus check
+      if (((a.svt == 0) || (a.svt == 3)) && (!a.seq.empty()) && (!b.seq.empty()) && ((int32_t) std::max(a.seq.size(), b.seq.size()) < c.seqCutoff)) {
+	double sid = _seqIdentity(a.seq, b.seq, c.juncSeqId);
+	if ((sid >= 0) && (sid < c.juncSeqId)) return false;
+      }
+      return true;
+    }
+  }
+
+
+  // Minimal disjoint set
+  struct UnionFind {
+    std::vector<int32_t> parent;
+    std::vector<int32_t> rank;
+
+    UnionFind(size_t n) : parent(n), rank(n, 0) {
+      for(size_t i = 0; i < n; ++i) parent[i] = (int32_t) i;
+    }
+    
+    inline int32_t
+    find(int32_t x) {
+      while (parent[x] != x) {
+	parent[x] = parent[parent[x]]; x = parent[x];
+      }
+      return x;
+    }
+
+    inline void
+    unite(int32_t a, int32_t b) {
+      a = find(a);
+      b = find(b);
+      if (a == b) return;
+      if (rank[a] < rank[b]) std::swap(a, b);
+      parent[b] = a;
+      if (rank[a] == rank[b]) ++rank[a];
+    }
+  };
+
+
+  // Repeat tracts
+  typedef std::map<int32_t, std::vector<std::pair<int32_t, int32_t> > > TKnownTracts;
+
+  // Pass 1: read all records for one SV type
+  template<typename TContigMap>
+  inline void
+  _collectSVtype(MergeConfig const& c, int32_t const svtin, TContigMap& cMap, std::vector<MergeSV>& nodes, TKnownTracts* knownTracts = nullptr) {
+    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+    std::cerr << '[' << boost::posix_time::to_simple_string(now) << "] " << "Reading input VCF/BCF files" << std::endl;
+
+    for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+      htsFile* ifile = bcf_open(c.files[file_c].string().c_str(), "r");
+      bcf_hdr_t* hdr = bcf_hdr_read(ifile);
+      bcf1_t* rec = bcf_init();
+      int32_t nsamples = bcf_hdr_nsamples(hdr);
+      bool siteList = (nsamples == 0);
+
+      int32_t nsvend = 0;
+      int32_t* svend = NULL;
+      int32_t ninslen = 0;
+      int32_t* inslen = NULL;
+      int32_t nct = 0;
+      char* ct = NULL;
+      int32_t nsvt = 0;
+      char* svt = NULL;
+      int32_t npos2 = 0;
+      int32_t* pos2 = NULL;
+      int32_t nchr2 = 0;
+      char* chr2 = NULL;
+      int32_t nhomlen = 0;
+      int32_t* homlen = NULL;
+      int32_t ntrp = 0;
+      int32_t* trp = NULL;
+      int32_t ntrsArr = 0;
+      int32_t* trsArr = NULL;
+      int32_t ntreArr = 0;
+      int32_t* treArr = NULL;
+      int32_t nsr = 0;
+      int32_t* sr = NULL;
+      int32_t nsrmapq = 0;
+      int32_t* srmapq = NULL;
+      int32_t nsrq = 0;
+      float* srq = NULL;
+      int32_t nce = 0;
+      float* ce = NULL;
+      int32_t nconsbp = 0;
+      int32_t* consbp = NULL;
+      int32_t ncons = 0;
+      char* cons = NULL;
+      int32_t nsub = 0;
+      char* sub = NULL;
+      int32_t nins = 0;
+      char* instr = NULL;
+      int32_t nac = 0;
+      int32_t* acArr = NULL;
+      int32_t nsuppArr = 0;
+      int32_t* suppArr = NULL;
+      int32_t nsvlen = 0;
+      int32_t* svlen = NULL;
+      int32_t nstdevpos = 0;
+      float* stdevpos = NULL;
+
+      while (bcf_read(ifile, hdr, rec) == 0) {
+	bcf_unpack(rec, BCF_UN_INFO);
+
+	bool pass = true;
+	if (c.filterForPass) pass = (bcf_has_filter(hdr, rec, const_cast<char*>("PASS")) == 1);
+	if (!pass) continue;
+
+	int32_t recsvt = -1;
+	if (bcf_get_info_string(hdr, rec, "SVTYPE", &svt, &nsvt) > 0) {
+	  bool hasCT = (bcf_get_info_string(hdr, rec, "CT", &ct, &nct) > 0);
+	  recsvt = _mergeDecodeSVT(std::string(svt), hasCT, hasCT ? std::string(ct) : std::string("NA"));
+	}
+	if (((recsvt == 2) || (recsvt == 4)) && (knownTracts != nullptr)) {
+	  // Collect discovery tracts
+	  if ((bcf_get_info_int32(hdr, rec, "TRSTART", &trsArr, &ntrsArr) > 0) && (bcf_get_info_int32(hdr, rec, "TREND", &treArr, &ntreArr) > 0)) {
+	    if ((*trsArr > 0) && (*treArr > *trsArr) && (*treArr - *trsArr <= 10000)) {
+	      std::string chrN(bcf_hdr_id2name(hdr, rec->rid));
+	      typename TContigMap::iterator cIt = cMap.find(chrN);
+	      if (cIt != cMap.end()) (*knownTracts)[cIt->second].push_back(std::make_pair(*trsArr - 1, *treArr));
+	    }
+	  }
+	}
+	if (recsvt != svtin) continue;
+
+	bool precise = (bcf_get_info_flag(hdr, rec, "PRECISE", 0, 0) > 0);
+	if ((c.filterForPrecise) && (!precise)) continue;
+	if (rec->qual < c.qualthres) continue;
+
+	std::string chrName(bcf_hdr_id2name(hdr, rec->rid));
+	if (cMap.find(chrName) == cMap.end()) continue;
+	int32_t tid = cMap[chrName];
+	int32_t svStart = rec->pos;
+	int32_t svEnd = svStart + 2;
+	int32_t realSize = 0;
+	if (bcf_get_info_int32(hdr, rec, "END", &svend, &nsvend) > 0) svEnd = *svend;
+	if (recsvt == 4) {
+	  int32_t inslenVal = 0;
+	  if (bcf_get_info_int32(hdr, rec, "INSLEN", &inslen, &ninslen) > 0) inslenVal = *inslen;
+	  // if INSLEN not present use SVLEN
+	  if (inslenVal == 0) {
+	    if (bcf_get_info_int32(hdr, rec, "SVLEN", &svlen, &nsvlen) > 0) inslenVal = std::abs(*svlen);
+	  }
+	  if ((inslenVal < (int32_t) c.minsize) || (inslenVal > (int32_t) c.maxsize)) continue;
+	  realSize = inslenVal;
+	  svEnd = svStart + inslenVal;  // pseudo-end for reciprocal overlap
+	} else if (!_translocation(recsvt)) {
+	  realSize = svEnd - svStart;
+	  if (realSize <= 0) {
+	    if (bcf_get_info_int32(hdr, rec, "SVLEN", &svlen, &nsvlen) > 0) {
+	      realSize = std::abs(*svlen);
+	      svEnd = svStart + realSize;
+	    }
+	  }
+	  if ((realSize < (int32_t) c.minsize) || (realSize > (int32_t) c.maxsize)) continue;
+	}
+
+	// Second breakpoint for translocations
+	int32_t mtid = tid;
+	int32_t pos2val = 0;
+	if (bcf_get_info_string(hdr, rec, "CHR2", &chr2, &nchr2) > 0) {
+	  std::string chr2Name(chr2);
+	  if (cMap.find(chr2Name) != cMap.end()) mtid = cMap[chr2Name];
+	  if (bcf_get_info_int32(hdr, rec, "POS2", &pos2, &npos2) > 0) pos2val = *pos2;
+	} else if (_translocation(recsvt)) {
+	  // Parse BND ALT notation
+	  std::string altStr = (rec->n_allele > 1) ? std::string(rec->d.allele[1]) : std::string();
+	  std::string chr2Name; int32_t p2 = 0;
+	  if (_parseBndMate(altStr, chr2Name, p2)) {
+	    if (cMap.find(chr2Name) != cMap.end()) mtid = cMap[chr2Name];
+	    pos2val = p2;
+	  }
+	}
+
+	// Carrier / allele-count contribution of this record
+	int32_t suppVal = 1;
+	int32_t acVal = 1;
+	int32_t altSupportVal = 0;
+	if (siteList) {
+	  // Re-merge of a site list
+	  if (bcf_get_info_int32(hdr, rec, "SUPP", &suppArr, &nsuppArr) > 0) suppVal = *suppArr;
+	  if (bcf_get_info_int32(hdr, rec, "AC", &acArr, &nac) > 0) acVal = *acArr;
+	} else {
+	// Per-sample genotypes
+	  bcf_unpack(rec, BCF_UN_ALL);
+	  int ndv = 0; int32_t* dv = NULL;
+	  int ndr = 0; int32_t* dr = NULL;
+	  int nrv = 0; int32_t* rv = NULL;
+	  int nrr = 0; int32_t* rr = NULL;
+	  int ngt = 0; int32_t* gt = NULL;
+	  bcf_get_format_int32(hdr, rec, "DV", &dv, &ndv);
+	  bcf_get_format_int32(hdr, rec, "DR", &dr, &ndr);
+	  bcf_get_format_int32(hdr, rec, "RV", &rv, &nrv);
+	  bcf_get_format_int32(hdr, rec, "RR", &rr, &nrr);
+	  bcf_get_format_int32(hdr, rec, "GT", &gt, &ngt);
+	  int32_t carriers = 0;
+	  int32_t alleles = 0;
+	  int32_t maxVar = 0;
+	  int32_t gtStride = (ngt > 0) ? (ngt / nsamples) : 0;
+	  for(int32_t i = 0; i < nsamples; ++i) {
+	    int32_t a0 = 0;
+	    int32_t a1 = 0;
+	    if (ngt > 0) {
+	      // Haploid samples carry a single allele
+	      int32_t g0 = gt[i * gtStride];
+	      int32_t g1 = (gtStride > 1) ? gt[i * gtStride + 1] : bcf_int32_vector_end;
+	      if (bcf_gt_is_missing(g0)) continue;
+	      a0 = bcf_gt_allele(g0);
+	      if (g1 == bcf_int32_vector_end) a1 = 0;
+	      else {
+		if (bcf_gt_is_missing(g1)) continue;
+		a1 = bcf_gt_allele(g1);
+	      }
+	    }
+	    int32_t altcn = (a0 > 0 ? 1 : 0) + (a1 > 0 ? 1 : 0);
+	    uint32_t supportsum = 0;
+	    int32_t varReads = 0;
+	    double vafval = 0;
+	    if (precise && (nrv > i) && (nrr > i)) {
+	      // Use RR and RV
+	      supportsum = rr[i] + rv[i];
+	      varReads = rv[i];
+	    }
+	    else if ((ndv > i) && (ndr > i)) {
+	      // Fallback to DR and DV
+	      supportsum = dr[i] + dv[i];
+	      varReads = dv[i];
+	    }
+	    if (supportsum > 0) vafval = (double) varReads / (double) supportsum;
+	    if (ngt > 0) {
+	      if (altcn == 0) continue;  // homozygous reference
+	    } else {
+	      // No genotypes
+	      if ((vafval < c.vaf) || (supportsum < c.coverage)) continue;
+	      altcn = (vafval > 0.75) ? 2 : 1;
+	    }
+	    if ((c.vaf > 0) || (c.coverage > 0)) {
+	      if ((vafval < c.vaf) || (supportsum < c.coverage)) continue;
+	    }
+	    ++carriers;
+	    alleles += altcn;
+	    if (varReads > maxVar) maxVar = varReads;
+	  }
+	  if (dv != NULL) free(dv);
+	  if (dr != NULL) free(dr);
+	  if (rv != NULL) free(rv);
+	  if (rr != NULL) free(rr);
+	  if (gt != NULL) free(gt);
+	  if (carriers == 0) continue;
+	  suppVal = carriers;
+	  acVal = alleles;
+	  altSupportVal = maxVar;
+	}
+
+	// Subtype, strand, repeat annotation
+	int8_t subtype = 0;
+	if (bcf_get_info_string(hdr, rec, "SUBTYPE", &sub, &nsub) > 0) subtype = _subtypeCode(std::string(sub));
+	int8_t insStrand = -1;
+	if (bcf_get_info_string(hdr, rec, "INSSTRAND", &instr, &nins) > 0) insStrand = (instr[0] == '-') ? 1 : 0;
+	int32_t homlenVal = 0;
+	if (bcf_get_info_int32(hdr, rec, "HOMLEN", &homlen, &nhomlen) > 0) homlenVal = *homlen;
+	else if (bcf_get_info_float(hdr, rec, "STDEV_POS", &stdevpos, &nstdevpos) > 0) homlenVal = (int32_t) (*stdevpos + 0.5f);
+	int32_t trPeriod = 0;
+	if (bcf_get_info_int32(hdr, rec, "TRPERIOD", &trp, &ntrp) > 0) trPeriod = *trp;
+	int32_t trsVal = -1;
+	int32_t treVal = -1;
+	if ((recsvt == 2) || (recsvt == 4)) {
+	  if ((bcf_get_info_int32(hdr, rec, "TRSTART", &trsArr, &ntrsArr) > 0) && (bcf_get_info_int32(hdr, rec, "TREND", &treArr, &ntreArr) > 0)) {
+	    if ((*trsArr > 0) && (*treArr > *trsArr)) {
+	      trsVal = *trsArr - 1;
+	      treVal = *treArr;
+	    }
+	  }
+	}
+
+	// Split-read support
+	int32_t srVal = 0;
+	if (bcf_get_info_int32(hdr, rec, "SR", &sr, &nsr) > 0) srVal = *sr;
+	int32_t srmapqVal = 0;
+	if (bcf_get_info_int32(hdr, rec, "SRMAPQ", &srmapq, &nsrmapq) > 0) srmapqVal = *srmapq;
+	float srqVal = 0;
+	if (bcf_get_info_float(hdr, rec, "SRQ", &srq, &nsrq) > 0) srqVal = *srq;
+	float ceVal = 0;
+	if (bcf_get_info_float(hdr, rec, "CE", &ce, &nce) > 0) ceVal = *ce;
+
+	// SV sequence
+	std::string seq;
+	{
+	  std::string altAllele = (rec->n_allele > 1) ? std::string(rec->d.allele[1]) : std::string();
+	  std::string refAllele(rec->d.allele[0]);
+	  if (recsvt == 4) {
+	    if ((!altAllele.empty()) && (altAllele[0] != '<')) {
+	      if ((altAllele.size() > 1) && (realSize <= c.seqCutoff)) seq = boost::to_upper_copy(altAllele.substr(1));
+	    } else if (precise) {
+	      // Symbolic insertion: use consensus
+	      int32_t consBpVal = -1;
+	      if (bcf_get_info_int32(hdr, rec, "CONSBP", &consbp, &nconsbp) > 0) consBpVal = *consbp;
+	      if (bcf_get_info_string(hdr, rec, "CONSENSUS", &cons, &ncons) > 0) {
+		std::string consStr = boost::to_upper_copy(std::string(cons));
+		if ((consBpVal >= 0) && (realSize > 0) && (consBpVal + realSize <= (int32_t) consStr.size())) seq = consStr.substr(consBpVal, realSize);
+	      }
+	    }
+	  } else if ((recsvt == 2) && (realSize <= c.seqCutoff)) {
+	    // Deletion: deleted reference bases (delly emits exact REF up to seqCutoff)
+	    if (refAllele.size() > 1) seq = boost::to_upper_copy(refAllele.substr(1));
+	  } else if ((recsvt == 0) || (recsvt == 3) || (_translocation(recsvt))) {
+	    // INV/DUP/BND: breakpoint-junction consensus for adjacency corroboration
+	    if (bcf_get_info_string(hdr, rec, "CONSENSUS", &cons, &ncons) > 0) {
+	      std::string consStr = boost::to_upper_copy(std::string(cons));
+	      if ((int32_t) consStr.size() <= c.seqCutoff) seq = consStr;
+	    }
+	  }
+	}
+
+	MergeSV n;
+	n.tid = tid;
+	n.mtid = mtid;
+	n.svStart = svStart;
+	n.svEnd = svEnd;
+	n.pos2 = pos2val;
+	n.size = realSize;
+	n.svt = recsvt;
+	n.homlen = homlenVal;
+	n.trperiod = ((trPeriod < 0) || (trPeriod > 10000)) ? 0 : trPeriod;
+	n.score = (int32_t) rec->qual;
+	n.fileIdx = file_c;
+	n.supp = suppVal;
+	n.ac = acVal;
+	n.sr = srVal;
+	n.srmapq = srmapqVal;
+	n.altSupport = altSupportVal;
+	n.subtype = subtype;
+	n.insStrand = insStrand;
+	n.precise = precise;
+	n.fromSiteList = siteList;
+	n.srq = srqVal;
+	n.ce = ceVal;
+	n.comp = -1;
+	n.trStart = trsVal;
+	n.trEnd = treVal;
+	n.id = std::string(rec->d.id);
+	n.seq = seq;
+	nodes.push_back(n);
+      }
+      if (svend != NULL) free(svend);
+      if (inslen != NULL) free(inslen);
+      if (ct != NULL) free(ct);
+      if (svt != NULL) free(svt);
+      if (pos2 != NULL) free(pos2);
+      if (chr2 != NULL) free(chr2);
+      if (homlen != NULL) free(homlen);
+      if (trp != NULL) free(trp);
+      if (trsArr != NULL) free(trsArr);
+      if (treArr != NULL) free(treArr);
+      if (sr != NULL) free(sr);
+      if (srmapq != NULL) free(srmapq);
+      if (srq != NULL) free(srq);
+      if (ce != NULL) free(ce);
+      if (consbp != NULL) free(consbp);
+      if (cons != NULL) free(cons);
+      if (sub != NULL) free(sub);
+      if (instr != NULL) free(instr);
+      if (acArr != NULL) free(acArr);
+      if (suppArr != NULL) free(suppArr);
+      if (svlen != NULL) free(svlen);
+      if (stdevpos != NULL) free(stdevpos);
+      bcf_hdr_destroy(hdr);
+      bcf_close(ifile);
+      bcf_destroy(rec);
+    }
+    if (knownTracts != nullptr) {
+      for(TKnownTracts::iterator kt = knownTracts->begin(); kt != knownTracts->end(); ++kt) {
+	std::sort(kt->second.begin(), kt->second.end());
+	kt->second.erase(std::unique(kt->second.begin(), kt->second.end()), kt->second.end());
+      }
+    }
+  }
+
+
+  inline bool
+  _retainAllele(MergeConfig const& c, MergeSV const& rep, int32_t const supp) {
+    int32_t minSingletonSR = 3;
+    if (supp >= c.recurrentSamples) return true;  // recurrent
+    if (rep.fromSiteList) return true;            // pre-existing site
+    if (_translocation(rep.svt)) return (supp >= 2);
+    if (!rep.precise) return (supp >= 2);
+    if ((rep.srq > 0) || (rep.sr > 0)) {
+      // Singleton split-read call
+      return ((rep.sr >= minSingletonSR) && (rep.srmapq >= 20) && (rep.srq >= 0.8) && (rep.ce >= 1.0));
+    }
+    // Simple SR support
+    return (rep.altSupport >= minSingletonSR);
+  }
+
+  // Allele similarity
+  inline double
+  _alleleSim(MergeConfig const& c, MergeSV const& a, MergeSV const& b) {
+    if ((!a.seq.empty()) && (!b.seq.empty()) && ((int32_t) std::max(a.seq.size(), b.seq.size()) < c.seqCutoff)) {
+      double sid = _seqIdentity(a.seq, b.seq, 0.0);
+      if (sid >= 0.0) return sid;
+    }
+    double minS = (double) std::min(a.size, b.size);
+    double maxS = (double) std::max(a.size, b.size);
+    return (maxS > 0.0) ? (minS / maxS) : 1.0;
+  }
+
+  // Tandem repeat period
+  inline int32_t
+  _trPeriod(MergeSV const& n, std::string const& chrSeq) {
+    if ((n.trperiod > 0) && (n.trperiod <= 100)) return n.trperiod;
+    if ((!n.seq.empty()) && (n.seq.size() <= 2000)) {
+      int32_t p = detectTandemRepeat(n.seq, 100, 0.85f).first;
+      if (p > 0) return p;
+    }
+    return _trFlankPeriod(chrSeq, n.svStart + 1);
+  }
+
+  inline void
+  _clusterAndSelect(MergeConfig& c, std::vector<MergeSV>& nodes, boost::unordered_map<std::string, MergeAgg>& selected, std::vector<AlleleGroup>* outGroups = nullptr, std::map<std::string, uint32_t> const* cMap = nullptr, TKnownTracts const* knownTracts = nullptr) {
+    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+    std::cerr << '[' << boost::posix_time::to_simple_string(now) << "] " << "Clustering and merging SVs" << std::endl;
+    if (nodes.empty()) return;
+
+    // Sort by (tid, svStart)
+    std::sort(nodes.begin(), nodes.end(), [](MergeSV const& a, MergeSV const& b) {
+      return (a.tid < b.tid) || ((a.tid == b.tid) && (a.svStart < b.svStart)); });
+
+    // Single-linkage
+    int32_t maxSize = 0, maxHom = 0, maxPeriod = 0;
+    for(size_t i = 0; i < nodes.size(); ++i) {
+      if (nodes[i].size > maxSize) maxSize = nodes[i].size;
+      if (nodes[i].homlen > maxHom) maxHom = nodes[i].homlen;
+      if (nodes[i].trperiod > maxPeriod) maxPeriod = nodes[i].trperiod;
+    }
+    int32_t scanWin = std::max((int32_t) c.bpoffset, std::max(c.meiOffset, c.trOffset));
+    scanWin = std::max(scanWin, (int32_t) (c.trFrac * maxSize));
+    scanWin = std::max(scanWin, 2 * maxPeriod);
+    scanWin = std::max(scanWin, maxHom + 10);
+    UnionFind uf(nodes.size());
+    for(size_t i = 0; i < nodes.size(); ++i) {
+      for(size_t j = i; j > 0; ) {
+	--j;
+	if (nodes[j].tid != nodes[i].tid) break;
+	if (nodes[i].svStart - nodes[j].svStart > scanWin) break;
+	if (uf.find((int32_t) i) == uf.find((int32_t) j)) continue;
+	if (_svMatch(c, nodes[i], nodes[j])) uf.unite((int32_t) i, (int32_t) j);
+      }
+    }
+
+    // Gather components
+    boost::unordered_map<int32_t, std::vector<int32_t> > comps;
+    for(size_t i = 0; i < nodes.size(); ++i) comps[uf.find((int32_t) i)].push_back((int32_t) i);
+    typedef std::vector<std::vector<int32_t> > TCompVec;
+    TCompVec compVec;
+    std::vector<int32_t> compTs;
+    std::vector<int32_t> compTe;
+    for(boost::unordered_map<int32_t, std::vector<int32_t> >::iterator it = comps.begin(); it != comps.end(); ++it) compVec.push_back(it->second);
+    comps.clear();
+
+    // Tandem repeat?
+    bool useTract = ((c.longread) && (c.hasGenome) && (cMap != nullptr) && (!nodes.empty()) && ((nodes[0].svt == 2) || (nodes[0].svt == 4)));
+    faidx_t* fai = NULL;
+    if (useTract) {
+      fai = fai_load(c.genome.string().c_str());
+      if (fai == NULL) {
+	useTract = false;
+      }
+    }
+    if (useTract) {
+      std::sort(compVec.begin(), compVec.end(), [&](std::vector<int32_t> const& a, std::vector<int32_t> const& b) { return (nodes[a[0]].tid < nodes[b[0]].tid) || ((nodes[a[0]].tid == nodes[b[0]].tid) && ((nodes[a[0]].svStart < nodes[b[0]].svStart) || ((nodes[a[0]].svStart == nodes[b[0]].svStart) && (a[0] < b[0])))); });
+      compTs.assign(compVec.size(), -1);
+      compTe.assign(compVec.size(), -1);
+      std::map<uint32_t, std::string> rMap;
+      for(std::map<std::string, uint32_t>::const_iterator cIt = cMap->begin(); cIt != cMap->end(); ++cIt) rMap[cIt->second] = cIt->first;
+      int32_t curTid = -1;
+      std::string chrSeq;
+      int32_t const maxTract = 10000;
+      int32_t const trFlank = 200;
+      // Repeat tract key (coordinates, size, period, sequence)
+      typedef std::tuple<int32_t, int32_t, int32_t, int32_t, std::size_t> TTractKey;
+      std::map<TTractKey, std::pair<int32_t, int32_t> > tractMemo;
+      for(size_t ci = 0; ci < compVec.size(); ++ci) {
+	int32_t rep = compVec[ci][0];
+	for(size_t k = 1; k < compVec[ci].size(); ++k) {
+	  if ((nodes[compVec[ci][k]].score > nodes[rep].score) || ((nodes[compVec[ci][k]].score == nodes[rep].score) && (nodes[compVec[ci][k]].srq > nodes[rep].srq))) rep = compVec[ci][k];
+	}
+	if (nodes[rep].tid != curTid) {
+	  curTid = nodes[rep].tid;
+	  chrSeq.clear();
+	  tractMemo.clear();
+	  if ((rMap.find(curTid) != rMap.end()) && (faidx_has_seq(fai, rMap[curTid].c_str()))) {
+	    int32_t seqlen = -1;
+	    char* seq = faidx_fetch_seq(fai, rMap[curTid].c_str(), 0, faidx_seq_len(fai, rMap[curTid].c_str()), &seqlen);
+	    if (seq != NULL) {
+	      chrSeq.assign(seq, seqlen);
+	      free(seq);
+	      boost::to_upper(chrSeq);
+	    }
+	  }
+	}
+	// Repeat lengths
+	if (chrSeq.empty()) continue;
+	// Repeat tract
+	int32_t uts = -1, ute = -1;
+	for(size_t k = 0; k < compVec[ci].size(); ++k) {
+	  MergeSV const& mn = nodes[compVec[ci][k]];
+	  if (!mn.precise) continue;
+	  // A deletion longer than the repeat
+	  if ((mn.svt == 2) && (mn.svEnd - mn.svStart > maxTract + 2 * trFlank)) continue;
+	  int32_t ts = -1, te = -1;
+	  if ((mn.trStart >= 0) && (mn.trEnd > mn.trStart)) {
+	    ts = mn.trStart;
+	    te = mn.trEnd;
+	  } else {
+	    TTractKey mk = std::make_tuple(mn.svStart, mn.svEnd, mn.size, mn.trperiod, std::hash<std::string>()(mn.seq));
+	    std::map<TTractKey, std::pair<int32_t, int32_t> >::const_iterator mIt = tractMemo.find(mk);
+	    if (mIt != tractMemo.end()) {
+	      ts = mIt->second.first;
+	      te = mIt->second.second;
+	    } else {
+	      bool ok = false;
+	      if (knownTracts != nullptr) {
+		TKnownTracts::const_iterator kt = knownTracts->find(mn.tid);
+		if (kt != knownTracts->end()) {
+		  int32_t svE = (mn.svt == 4) ? mn.svStart : mn.svEnd;
+		  std::vector<std::pair<int32_t, int32_t> > const& kv = kt->second;
+		  size_t hi = std::upper_bound(kv.begin(), kv.end(), std::make_pair(mn.svStart + 200, std::numeric_limits<int32_t>::max())) - kv.begin();
+		  int32_t bestLen = std::numeric_limits<int32_t>::max();
+		  for(size_t ki = hi; ki > 0; ) {
+		    --ki;
+		    if (kv[ki].first < mn.svStart - 10200) break;
+		    if ((mn.svStart >= kv[ki].first - 200) && (svE <= kv[ki].second + 200) && (kv[ki].second - kv[ki].first < bestLen)) {
+		      bestLen = kv[ki].second - kv[ki].first;
+		      ts = kv[ki].first;
+		      te = kv[ki].second;
+		      ok = true;
+		    }
+		  }
+		}
+	      }
+	      if (!ok) {
+		auto anchorTract = [&](int32_t const q) {
+		  bool found = ((_trTract(chrSeq, mn.svStart + 1, q, ts, te)) || (_trTract(chrSeq, mn.svStart + 1 - q, q, ts, te)));
+		  if ((!found) && (mn.svt == 2)) found = ((_trTract(chrSeq, mn.svEnd, q, ts, te)) || (_trTract(chrSeq, mn.svEnd - q, q, ts, te)));
+		  return found;
+		};
+		int32_t p = _trPeriod(mn, chrSeq);
+		ok = anchorTract(p);
+		if (!ok) {
+		  int32_t pw = _trWindowPeriod(chrSeq.data(), (int32_t) chrSeq.size(), std::max(0, mn.svStart - 100), std::min((int32_t) chrSeq.size(), ((mn.svt == 4) ? mn.svStart : mn.svEnd) + 100), 0.7f);
+		  if ((pw > 0) && (pw != p)) ok = anchorTract(pw);
+		}
+	      }
+	      if (!ok) {
+		ts = -1;
+		te = -1;
+	      }
+	      tractMemo[mk] = std::make_pair(ts, te);
+	    }
+	  }
+	  if ((ts < 0) || (te - ts > maxTract)) continue;
+	  if (uts < 0) {
+	    uts = ts;
+	    ute = te;
+	  } else {
+	    uts = std::min(uts, ts);
+	    ute = std::max(ute, te);
+	  }
+	}
+	if ((uts >= 0) && (ute - uts <= maxTract)) {
+	  compTs[ci] = uts;
+	  compTe[ci] = ute;
+	}
+      }
+      fai_destroy(fai);
+      fai = NULL;
+      UnionFind cuf((int32_t) compVec.size());
+      std::vector<int32_t> rootTs(compTs);
+      std::vector<int32_t> rootTe(compTe);
+      std::vector<int32_t> tractOrder;
+      for(size_t ci = 0; ci < compVec.size(); ++ci) {
+	if (compTs[ci] >= 0) tractOrder.push_back((int32_t) ci);
+      }
+      std::sort(tractOrder.begin(), tractOrder.end(), [&](int32_t a, int32_t b) { return (nodes[compVec[a][0]].tid < nodes[compVec[b][0]].tid) || ((nodes[compVec[a][0]].tid == nodes[compVec[b][0]].tid) && ((compTs[a] < compTs[b]) || ((compTs[a] == compTs[b]) && ((compTe[a] < compTe[b]) || ((compTe[a] == compTe[b]) && (a < b)))))); });
+      for(size_t oi = 1; oi < tractOrder.size(); ++oi) {
+	int32_t ci = tractOrder[oi];
+	for(size_t oj = oi; oj > 0; ) {
+	  --oj;
+	  int32_t cj = tractOrder[oj];
+	  if (nodes[compVec[cj][0]].tid != nodes[compVec[ci][0]].tid) break;
+	  if (compTs[ci] - compTs[cj] > 20000) break;
+	  int32_t ovl = std::min(compTe[ci], compTe[cj]) - compTs[ci];
+	  int32_t shorter = std::min(compTe[ci] - compTs[ci], compTe[cj] - compTs[cj]);
+	  if (2 * ovl < shorter) continue;
+	  int32_t ri = cuf.find(ci);
+	  int32_t rj = cuf.find(cj);
+	  if (ri == rj) continue;
+	  if (std::max(rootTe[ri], rootTe[rj]) - std::min(rootTs[ri], rootTs[rj]) > maxTract) continue;
+	  cuf.unite(ri, rj);
+	  int32_t r = cuf.find(ri);
+	  rootTs[r] = std::min(rootTs[ri], rootTs[rj]);
+	  rootTe[r] = std::max(rootTe[ri], rootTe[rj]);
+	}
+      }
+      TCompVec mergedVec;
+      std::vector<int32_t> mTs, mTe;
+      boost::unordered_map<int32_t, int32_t> rootIdx;
+      for(size_t ci = 0; ci < compVec.size(); ++ci) {
+	int32_t r = cuf.find((int32_t) ci);
+	if (rootIdx.find(r) == rootIdx.end()) {
+	  rootIdx[r] = (int32_t) mergedVec.size();
+	  mergedVec.push_back(std::vector<int32_t>());
+	  mTs.push_back(compTs[ci]);
+	  mTe.push_back(compTe[ci]);
+	}
+	int32_t mi = rootIdx[r];
+	mergedVec[mi].insert(mergedVec[mi].end(), compVec[ci].begin(), compVec[ci].end());
+	if (compTs[ci] >= 0) {
+	  if ((mTs[mi] < 0) || (compTs[ci] < mTs[mi])) mTs[mi] = compTs[ci];
+	  if (compTe[ci] > mTe[mi]) mTe[mi] = compTe[ci];
+	}
+      }
+      compVec.swap(mergedVec);
+      compTs.swap(mTs);
+      compTe.swap(mTe);
+
+      // Components inside a repeat tract
+      int32_t const joinFlank = 200;
+      std::vector<int32_t> tracted;
+      for(size_t ci = 0; ci < compVec.size(); ++ci) {
+	if (compTs[ci] >= 0) tracted.push_back((int32_t) ci);
+      }
+      std::sort(tracted.begin(), tracted.end(), [&](int32_t a, int32_t b) { return (nodes[compVec[a][0]].tid < nodes[compVec[b][0]].tid) || ((nodes[compVec[a][0]].tid == nodes[compVec[b][0]].tid) && ((compTs[a] < compTs[b]) || ((compTs[a] == compTs[b]) && ((compTe[a] < compTe[b]) || ((compTe[a] == compTe[b]) && (a < b)))))); });
+      for(size_t ci = 0; ci < compVec.size(); ++ci) {
+	if ((compTs[ci] >= 0) || (compVec[ci].empty())) continue;
+	int32_t tid = nodes[compVec[ci][0]].tid;
+	int32_t minS = std::numeric_limits<int32_t>::max();
+	int32_t maxE = 0;
+	bool eligible = true;
+	for(size_t k = 0; k < compVec[ci].size(); ++k) {
+	  MergeSV const& mn = nodes[compVec[ci][k]];
+	  if ((!mn.precise) || ((mn.subtype >= 1) && (mn.subtype <= 6))) {
+	    eligible = false;
+	    break;
+	  }
+	  int32_t svE = (mn.svt == 4) ? mn.svStart : mn.svEnd;
+	  minS = std::min(minS, mn.svStart);
+	  maxE = std::max(maxE, svE);
+	}
+	if (!eligible) continue;
+	int32_t best = -1;
+	int32_t bestOvl = std::numeric_limits<int32_t>::min();
+	std::pair<int32_t, int32_t> key = std::make_pair(tid, minS + joinFlank);
+	size_t hi = std::upper_bound(tracted.begin(), tracted.end(), key, [&](std::pair<int32_t, int32_t> const& kv, int32_t b) { return (kv.first < nodes[compVec[b][0]].tid) || ((kv.first == nodes[compVec[b][0]].tid) && (kv.second < compTs[b])); }) - tracted.begin();
+	for(size_t ti = hi; ti > 0; ) {
+	  --ti;
+	  int32_t cj = tracted[ti];
+	  if (nodes[compVec[cj][0]].tid != tid) break;
+	  if (compTs[cj] < minS - maxTract - joinFlank) break;
+	  if ((minS >= compTs[cj] - joinFlank) && (maxE <= compTe[cj] + joinFlank)) {
+	    int32_t ovl = std::min(maxE, compTe[cj]) - std::max(minS, compTs[cj]);
+	    if ((ovl > bestOvl) || ((ovl == bestOvl) && (compTs[cj] < compTs[best]))) {
+	      best = cj;
+	      bestOvl = ovl;
+	    }
+	  }
+	}
+	if (best < 0) continue;
+	compVec[best].insert(compVec[best].end(), compVec[ci].begin(), compVec[ci].end());
+	compVec[ci].clear();
+      }
+
+      // Alleles inside/outside repeat
+      size_t ncomp = compVec.size();
+      for(size_t ci = 0; ci < ncomp; ++ci) {
+	if (compTs[ci] < 0) continue;
+	std::vector<int32_t> inside;
+	std::vector<int32_t> outside;
+	for(size_t k = 0; k < compVec[ci].size(); ++k) {
+	  MergeSV const& n = nodes[compVec[ci][k]];
+	  int32_t svE = (n.svt == 4) ? n.svStart : n.svEnd;
+	  if ((n.svStart < compTs[ci] - trFlank) || (svE > compTe[ci] + trFlank)) outside.push_back(compVec[ci][k]);
+	  else inside.push_back(compVec[ci][k]);
+	}
+	if (outside.empty()) continue;
+	if (inside.empty()) {
+	  compTs[ci] = -1;
+	  compTe[ci] = -1;
+	} else {
+	  compVec[ci].swap(inside);
+	  compVec.push_back(outside);
+	  compTs.push_back(-1);
+	  compTe.push_back(-1);
+	}
+      }
+    }
+
+    for(size_t ci = 0; ci < compVec.size(); ++ci) {
+      std::vector<int32_t>& members = compVec[ci];
+      int32_t trS = (useTract) ? compTs[ci] : -1;
+      int32_t trE = (useTract) ? compTe[ci] : -1;
+      std::sort(members.begin(), members.end(), [&](int32_t a, int32_t b) { return nodes[a].size < nodes[b].size; });
+      std::vector<std::vector<int32_t> > groups;
+      if (trS >= 0) {
+	// Tandem repeat locus
+	typedef std::pair<int32_t, int32_t> TSizeSupport;
+	std::vector<TSizeSupport> sizes;
+	for(size_t k = 0; k < members.size(); ++k) {
+	  int32_t supp = std::max(1, nodes[members[k]].supp);
+	  if ((sizes.empty()) || (sizes.back().first != nodes[members[k]].size)) sizes.push_back(std::make_pair(nodes[members[k]].size, supp));
+	  else sizes.back().second += supp;
+	}
+	std::vector<int32_t> order(sizes.size());
+	for(size_t k = 0; k < sizes.size(); ++k) order[k] = (int32_t) k;
+	std::sort(order.begin(), order.end(), [&](int32_t x, int32_t y) { return (sizes[x].second > sizes[y].second) || ((sizes[x].second == sizes[y].second) && (sizes[x].first < sizes[y].first)); });
+	std::vector<int32_t> lead;
+	std::map<int32_t, int32_t> leadOf;
+	std::map<int32_t, int32_t> sizeRep;   // best record per size
+	for(size_t k = 0; k < members.size(); ++k) {
+	  int32_t s = nodes[members[k]].size;
+	  if ((sizeRep.find(s) == sizeRep.end()) || (nodes[members[k]].score > nodes[sizeRep[s]].score)) sizeRep[s] = members[k];
+	}
+	for(size_t oi = 0; oi < order.size(); ++oi) {
+	  int32_t s = sizes[order[oi]].first;
+	  int32_t best = -1;
+	  int32_t bestDist = std::numeric_limits<int32_t>::max();
+	  for(size_t L = 0; L < lead.size(); ++L) {
+	    int32_t tolLen = std::max(c.trLenTol, (int32_t) std::lround(c.trLenFrac * (double) lead[L]));
+	    int32_t d = std::abs(s - lead[L]);
+	    if ((d <= tolLen) && (d < bestDist)) {
+	      if ((d > 0) && (nodes[members[0]].svt == 4)) {
+		// Join based on seq. similarity
+		MergeSV const& a = nodes[sizeRep[s]];
+		MergeSV const& b = nodes[sizeRep[lead[L]]];
+		if ((!a.seq.empty()) && (!b.seq.empty()) && ((int32_t) std::max(a.seq.size(), b.seq.size()) < c.seqCutoff)) {
+		  double sid = _bestSeqIdentity(a.seq, b.seq, std::abs(a.svStart - b.svStart), c.trSeqId, c.seqCutoff);
+		  if ((sid >= 0) && (sid < c.trSeqId)) continue;
+		}
+	      }
+	      best = lead[L];
+	      bestDist = d;
+	    }
+	  }
+	  if (best < 0) {
+	    lead.push_back(s);
+	    best = s;
+	  }
+	  leadOf[s] = best;
+	}
+	std::sort(lead.begin(), lead.end());
+	std::map<int32_t, int32_t> groupIdx;
+	for(size_t L = 0; L < lead.size(); ++L) groupIdx[lead[L]] = (int32_t) L;
+	groups.resize(lead.size());
+	for(size_t k = 0; k < members.size(); ++k) groups[groupIdx[leadOf[nodes[members[k]].size]]].push_back(members[k]);
+      } else if ((!members.empty()) && (nodes[members[0]].svt == 2) && (members.size() <= 20000)) {
+	double alleleId = 0.90;
+	std::vector<int32_t> order(members.begin(), members.end());
+	std::sort(order.begin(), order.end(), [&](int32_t x, int32_t y) { return nodes[x].score > nodes[y].score; });
+	std::vector<int32_t> lead;
+	for(size_t oi = 0; oi < order.size(); ++oi) {
+	  int32_t mi = order[oi];
+	  int32_t g = -1;
+	  for(size_t L = 0; L < lead.size(); ++L) {
+	    if (_alleleSim(c, nodes[mi], nodes[lead[L]]) >= alleleId) {
+	      g = (int32_t) L;
+	      break;
+	    }
+	  }
+	  if (g < 0) {
+	    lead.push_back(mi);
+	    groups.push_back(std::vector<int32_t>());
+	    g = (int32_t) groups.size() - 1;
+	  }
+	  groups[g].push_back(mi);
+	}
+	// Merge-in rare alleles
+	int32_t carrierFloor = (int32_t) std::ceil(c.repMinAF * (double) c.totalSamples);
+	if (carrierFloor < 1) carrierFloor = 1;
+	if ((carrierFloor > 1) && (groups.size() > 1)) {
+	  std::vector<int32_t> gcarr(groups.size());
+	  for(size_t g = 0; g < groups.size(); ++g) {
+	    std::set<int32_t> f;
+	    for(size_t k = 0; k < groups[g].size(); ++k) f.insert(nodes[groups[g][k]].fileIdx);
+	    gcarr[g] = (int32_t) f.size();
+	  }
+	  std::vector<std::vector<int32_t> > merged;
+	  std::vector<int32_t> keptG;
+	  for(size_t g = 0; g < groups.size(); ++g) {
+	    if (gcarr[g] >= carrierFloor) keptG.push_back((int32_t) g);
+	  }
+	  std::vector<int32_t> dest(groups.size(), -1);
+	  for(size_t g = 0; g < groups.size(); ++g) {
+	    if (gcarr[g] >= carrierFloor) continue;
+	    int32_t best = -1;
+	    double bestSim = c.recoverlap;
+	    for(size_t s = 0; s < keptG.size(); ++s) {
+	      double sim = _alleleSim(c, nodes[lead[g]], nodes[lead[keptG[s]]]);
+	      if (sim >= bestSim) {
+		bestSim = sim;
+		best = keptG[s];
+	      }
+	    }
+	    dest[g] = best; // -1 keep, otherwise merge
+	  }
+	  boost::unordered_map<int32_t, int32_t> outIdx;
+	  for(size_t g = 0; g < groups.size(); ++g) {
+	    int32_t target = (dest[g] >= 0) ? dest[g] : (int32_t) g;
+	    if (outIdx.find(target) == outIdx.end()) {
+	      outIdx[target] = (int32_t) merged.size();
+	      merged.push_back(std::vector<int32_t>());
+	    }
+	    std::vector<int32_t>& dst = merged[outIdx[target]];
+	    dst.insert(dst.end(), groups[g].begin(), groups[g].end());
+	  }
+	  groups.swap(merged);
+	}
+      } else {
+	std::vector<int32_t> cur;
+	for(size_t k = 0; k < members.size(); ++k) {
+	  if ((!cur.empty())) {
+	    int32_t prevSize = nodes[cur.back()].size;
+	    int32_t curSize = nodes[members[k]].size;
+	    int32_t gap = std::max(50, (int32_t) (0.25 * std::max(curSize, 1)));
+	    if (curSize - prevSize > gap) { groups.push_back(cur); cur.clear(); }
+	  }
+	  cur.push_back(members[k]);
+	}
+	if (!cur.empty()) groups.push_back(cur);
+      }
+
+      // Select SVs
+      std::vector<std::vector<int32_t> > keptGroups;
+      std::vector<int32_t> repIdx;
+      for(size_t g = 0; g < groups.size(); ++g) {
+	std::vector<int32_t>& grp = groups[g];
+	int32_t rep = grp[0];
+	for(size_t k = 1; k < grp.size(); ++k) {
+	  if (trS >= 0) {
+	    // Tandem repeat order
+	    MergeSV const& a = nodes[grp[k]];
+	    MergeSV const& b = nodes[rep];
+	    if ((a.supp > b.supp) || ((a.supp == b.supp) && ((a.score > b.score) || ((a.score == b.score) && ((a.srq > b.srq) || ((a.srq == b.srq) && (a.svStart < b.svStart))))))) rep = grp[k];
+	  } else if ((nodes[grp[k]].score > nodes[rep].score) || ((nodes[grp[k]].score == nodes[rep].score) && (nodes[grp[k]].srq > nodes[rep].srq))) rep = grp[k];
+	}
+	// Carrier and allele counts
+	boost::unordered_map<int32_t, std::pair<int32_t, int32_t> > perFile;
+	for(size_t k = 0; k < grp.size(); ++k) {
+	  int32_t f = nodes[grp[k]].fileIdx;
+	  std::pair<int32_t, int32_t> cur = std::make_pair(nodes[grp[k]].supp, nodes[grp[k]].ac);
+	  if (nodes[grp[k]].fromSiteList) {
+	    if (perFile.find(f) == perFile.end()) perFile[f] = cur;
+	    else {
+	      perFile[f].first += cur.first;
+	      perFile[f].second += cur.second;
+	    }
+	  } else if ((perFile.find(f) == perFile.end()) || (perFile[f].second < cur.second)) perFile[f] = cur;
+	}
+	int32_t supp = 0;
+	int32_t ac = 0;
+	for(boost::unordered_map<int32_t, std::pair<int32_t, int32_t> >::iterator pf = perFile.begin(); pf != perFile.end(); ++pf) {
+	  supp += pf->second.first;
+	  ac += pf->second.second;
+	}
+	if ((c.chunkMerge) && (c.totalSamples > 0)) {
+	  if (supp > (int32_t) c.totalSamples) supp = (int32_t) c.totalSamples;
+	  if (ac > 2 * (int32_t) c.totalSamples) ac = 2 * (int32_t) c.totalSamples;
+	}
+	if (supp < 1) continue;
+	if (!_retainAllele(c, nodes[rep], supp)) continue;
+	keptGroups.push_back(grp);
+	repIdx.push_back(rep);
+      }
+
+      int32_t nAllele = (int32_t) keptGroups.size();
+      if (nAllele == 0) continue;
+      uint32_t locusId = c.alleleCounter++;  // shared by all alleles of this locus
+      for(size_t g = 0; g < keptGroups.size(); ++g) {
+	std::vector<int32_t>& grp = keptGroups[g];
+	int32_t rep = repIdx[g];
+
+	boost::unordered_map<int32_t, std::pair<int32_t, int32_t> > perFile;
+	int32_t ciposLo = 0;
+	int32_t ciposHi = 0;
+	int32_t ciendLo = 0;
+	int32_t ciendHi = 0;
+	for(size_t k = 0; k < grp.size(); ++k) {
+	  int32_t f = nodes[grp[k]].fileIdx;
+	  std::pair<int32_t, int32_t> cur = std::make_pair(nodes[grp[k]].supp, nodes[grp[k]].ac);
+	  if (nodes[grp[k]].fromSiteList) {
+	    if (perFile.find(f) == perFile.end()) perFile[f] = cur;
+	    else {
+	      perFile[f].first += cur.first;
+	      perFile[f].second += cur.second;
+	    }
+	  } else if ((perFile.find(f) == perFile.end()) || (perFile[f].second < cur.second)) perFile[f] = cur;
+	  int32_t dPos = nodes[grp[k]].svStart - nodes[rep].svStart;
+	  int32_t dEnd = nodes[grp[k]].svEnd - nodes[rep].svEnd;
+	  if (dPos < ciposLo) ciposLo = dPos;
+	  if (dPos > ciposHi) ciposHi = dPos;
+	  if (dEnd < ciendLo) ciendLo = dEnd;
+	  if (dEnd > ciendHi) ciendHi = dEnd;
+	}
+	int32_t supp = 0; int32_t ac = 0;
+	for(boost::unordered_map<int32_t, std::pair<int32_t, int32_t> >::iterator pf = perFile.begin(); pf != perFile.end(); ++pf) { supp += pf->second.first; ac += pf->second.second; }
+	if ((c.chunkMerge) && (c.totalSamples > 0)) {
+	  if (supp > (int32_t) c.totalSamples) supp = (int32_t) c.totalSamples;
+	  if (ac > 2 * (int32_t) c.totalSamples) ac = 2 * (int32_t) c.totalSamples;
+	}
+
+	MergeAgg agg;
+	agg.ac = ac;
+	agg.an = 2 * (int32_t) c.totalSamples;
+	if (agg.an < ac) agg.an = ac;
+	agg.supp = supp;
+	agg.ciposLo = ciposLo;
+	agg.ciposHi = ciposHi;
+	agg.ciendLo = ciendLo;
+	agg.ciendHi = ciendHi;
+	agg.alleleId = locusId;
+	agg.nAllele = nAllele;
+	agg.trStart = trS;
+	agg.trEnd = trE;
+
+	std::string key = boost::lexical_cast<std::string>(nodes[rep].fileIdx) + "\t" + nodes[rep].id;
+	selected[key] = agg;
+
+	// Store group membership
+	if (outGroups != nullptr) {
+	  AlleleGroup ag;
+	  ag.rep = rep;
+	  ag.members = grp;
+	  ag.agg = agg;
+	  outGroups->push_back(ag);
+	}
+      }
+    }
+  }
+
+
+  // Create consensus
+  inline bool
+  _synthConsensus(faidx_t* fai, std::string const& chrom, int32_t const svt, int32_t const svStart0, int32_t const rsvEnd, std::string const& insSeq, std::string& consensus, int32_t& consBp, int32_t& insLen) {
+    int32_t flank = 600;
+    if (fai == NULL) return false;
+    if ((svt != 2) && (svt != 4)) return false;
+    int32_t chrlen = faidx_seq_len(fai, chrom.c_str());
+    if (chrlen <= 0) return false;
+    int32_t lbeg = std::max(0, svStart0 - flank + 1);
+    int32_t lend = svStart0;
+    int32_t rbeg = (svt == 4) ? (svStart0 + 1) : rsvEnd;
+    int32_t rend = std::min(chrlen - 1, rbeg + flank - 1);
+    if ((lend < lbeg) || (lend >= chrlen) || (rbeg < 0) || (rbeg > rend)) return false;
+    int32_t l1 = 0, l2 = 0;
+    char* lseq = faidx_fetch_seq(fai, chrom.c_str(), lbeg, lend, &l1);
+    char* rseq = faidx_fetch_seq(fai, chrom.c_str(), rbeg, rend, &l2);
+    if ((lseq == NULL) || (rseq == NULL) || (l1 <= 0) || (l2 <= 0)) {
+      if (lseq != NULL) free(lseq);
+      if (rseq != NULL) free(rseq);
+      return false;
+    }
+    std::string left = boost::to_upper_copy(std::string(lseq, lseq + l1));
+    std::string right = boost::to_upper_copy(std::string(rseq, rseq + l2));
+    free(lseq); free(rseq);
+    std::string ins = (svt == 4) ? boost::to_upper_copy(insSeq) : std::string();
+    consensus = left + ins + right;
+    consBp = (int32_t) left.size();
+    insLen = (int32_t) ins.size();
+    return true;
+  }
+
+
+  // Output selected SVs
+  template<typename TContigMap>
+  void _emitSelected(MergeConfig& c, int32_t const svtin, TContigMap& cMap, boost::unordered_map<std::string, MergeAgg>& selected) {
+    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+    std::cerr << '[' << boost::posix_time::to_simple_string(now) << "] " << "Writing merged SV sites" << std::endl;
+
+    // Reference
+    faidx_t* fai = NULL;
+    if (c.hasGenome) fai = fai_load(c.genome.string().c_str());
+    
+    std::string fmtout = "wb";
+    if (c.outfile.string() == "-") fmtout = "w";
+    htsFile *fp = hts_open(c.outfile.string().c_str(), fmtout.c_str());
+    bcf_hdr_t *hdr_out = bcf_hdr_init("w");
+    
+    boost::gregorian::date today = now.date();
+    std::string datestr("##fileDate=");
+    datestr += boost::gregorian::to_iso_string(today);
+    bcf_hdr_append(hdr_out, datestr.c_str());
+    bcf_hdr_append(hdr_out, "##ALT=<ID=DEL,Description=\"Deletion\">");
+    bcf_hdr_append(hdr_out, "##ALT=<ID=DUP,Description=\"Duplication\">");
+    bcf_hdr_append(hdr_out, "##ALT=<ID=INV,Description=\"Inversion\">");
+    bcf_hdr_append(hdr_out, "##ALT=<ID=BND,Description=\"Translocation\">");
+    bcf_hdr_append(hdr_out, "##ALT=<ID=INS,Description=\"Insertion\">");
+    bcf_hdr_append(hdr_out, "##FILTER=<ID=LowQual,Description=\"Poor quality and insufficient number of PEs and SRs.\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=CIEND,Number=2,Type=Integer,Description=\"Confidence interval around END, from observed breakpoint spread across merged samples\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=CIPOS,Number=2,Type=Integer,Description=\"Confidence interval around POS, from observed breakpoint spread across merged samples\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=CHR2,Number=1,Type=String,Description=\"Chromosome for POS2 coordinate in case of an inter-chromosomal translocation\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=POS2,Number=1,Type=Integer,Description=\"Genomic position for CHR2 in case of an inter-chromosomal translocation\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the structural variant\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=PE,Number=1,Type=Integer,Description=\"Paired-end support of the structural variant\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=MAPQ,Number=1,Type=Integer,Description=\"Median mapping quality of paired-ends\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SRMAPQ,Number=1,Type=Integer,Description=\"Median mapping quality of split-reads\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SR,Number=1,Type=Integer,Description=\"Split-read support\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SRQ,Number=1,Type=Float,Description=\"Split-read consensus alignment quality\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=CONSENSUS,Number=1,Type=String,Description=\"Split-read consensus sequence\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=CONSBP,Number=1,Type=Integer,Description=\"Consensus SV breakpoint position\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=CE,Number=1,Type=Float,Description=\"Consensus sequence entropy\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=CT,Number=1,Type=String,Description=\"Paired-end signature induced connection type\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"SV length; negative for DEL, positive for DUP/INV/INS.\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"Imprecise structural variation\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=PRECISE,Number=0,Type=Flag,Description=\"Precise structural variation\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SVMETHOD,Number=1,Type=String,Description=\"Type of approach used to detect SV\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=INSLEN,Number=1,Type=Integer,Description=\"Predicted length of the insertion\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=HOMLEN,Number=1,Type=Integer,Description=\"Predicted microhomology length using a max. edit distance of 2\">");
+    if (c.annotated) {
+      bcf_hdr_append(hdr_out, "##INFO=<ID=SUBTYPE,Number=1,Type=String,Description=\"SV subtype: INS:ME:ALU, INS:ME:LINE1, INS:ME:SVA, INS:NUMT, INS:LTR, INS:HERVK, INS:TR or DEL:TR\">");
+      bcf_hdr_append(hdr_out, "##INFO=<ID=INSSTRAND,Number=1,Type=String,Description=\"Insertion strand for MEIs\">");
+      bcf_hdr_append(hdr_out, "##INFO=<ID=TRPERIOD,Number=1,Type=Integer,Description=\"Tandem repeat period in bp\">");
+      bcf_hdr_append(hdr_out, "##INFO=<ID=TRCOPIES,Number=1,Type=Float,Description=\"Tandem repeat copy number\">");
+    }
+    bcf_hdr_append(hdr_out, "##INFO=<ID=TRSTART,Number=1,Type=Integer,Description=\"Start of the reference tandem repeat\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=TREND,Number=1,Type=Integer,Description=\"End of the reference tandem repeat\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count across merged samples\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total allele number across merged samples\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency (AC/AN)\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SUPP,Number=1,Type=Integer,Description=\"Number of carrier samples\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=ALLELEID,Number=1,Type=Integer,Description=\"Identifier of the merged locus\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=NALLELE,Number=1,Type=Integer,Description=\"Number of distinct alleles at this locus\">");
+
+    uint32_t numseq = 0;
+    typedef std::map<uint32_t, std::string> TReverseMap;
+    TReverseMap rMap;
+    for(typename TContigMap::iterator cIt = cMap.begin(); cIt != cMap.end(); ++cIt, ++numseq) rMap[cIt->second] = cIt->first;
+    for(typename TReverseMap::iterator rIt = rMap.begin(); rIt != rMap.end(); ++rIt) {
+      std::string refname("##contig=<ID=");
+      refname += rIt->second + ">";
+      bcf_hdr_append(hdr_out, refname.c_str());
+    }
+    bcf_hdr_add_sample(hdr_out, NULL);
+    if (bcf_hdr_write(fp, hdr_out) != 0) std::cerr << "Error: Failed to write BCF header!" << std::endl;
+    
+    bcf1_t *rout = bcf_init();
+    typedef std::vector<htsFile*> THtsFile;
+    typedef std::vector<bcf_hdr_t*> TBcfHeader;
+    typedef std::vector<bcf1_t*> TBcfRecord;
+    typedef std::vector<bool> TEof;
+    THtsFile ifile(c.files.size());
+    TBcfHeader hdr(c.files.size());
+    TBcfRecord rec(c.files.size());
+    TEof eof(c.files.size());
+    uint32_t allEOF = 0;
+    for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+      ifile[file_c] = bcf_open(c.files[file_c].string().c_str(), "r");
+      hdr[file_c] = bcf_hdr_read(ifile[file_c]);
+      if (bcf_hdr_set_samples(hdr[file_c], NULL, false) != 0) std::cerr << "Error: Failed to set sample information!" << std::endl;
+      rec[file_c] = bcf_init();
+      if (bcf_read(ifile[file_c], hdr[file_c], rec[file_c]) == 0) { bcf_unpack(rec[file_c], BCF_UN_INFO); eof[file_c] = false; }
+      else { ++allEOF; eof[file_c] = true; }
+    }
+
+    int32_t nsvend = 0;
+    int32_t* svend = NULL;
+    int32_t npe = 0;
+    int32_t* pe = NULL;
+    int32_t nsr = 0;
+    int32_t* sr = NULL;
+    int32_t ninslen = 0;
+    int32_t* inslen = NULL;
+    int32_t nsvlen = 0;
+    int32_t* svlen = NULL;
+    int32_t npos2 = 0;
+    int32_t* pos2 = NULL;
+    int32_t nconsbp = 0;
+    int32_t* consbp = NULL;
+    int32_t nhomlen = 0;
+    int32_t* homlen = NULL;
+    int32_t nmapq = 0;
+    int32_t* mapq = NULL;
+    int32_t nsrmapq = 0;
+    int32_t* srmapq = NULL;
+    int32_t nsrq = 0;
+    float* srq = NULL;
+    int32_t nct = 0;
+    char* ct = NULL;
+    int32_t nsvt = 0;
+    char* svt = NULL;
+    int32_t nchr2 = 0;
+    char* chr2 = NULL;
+    int32_t nce = 0;
+    float* ce = NULL;
+    int32_t ncons = 0;
+    char* cons = NULL;
+    int32_t nsub = 0;
+    char* sub = NULL;
+    int32_t nins = 0;
+    char* instr = NULL;
+    int32_t ntrp = 0;
+    int32_t* trp = NULL;
+    int32_t ntrc = 0;
+    float* trc = NULL;
+    while (allEOF < c.files.size()) {
+      int32_t idx = -1;
+      for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+	if (!eof[file_c]) {
+	  if ((idx < 0) || (rec[idx]->rid > rec[file_c]->rid) || ((rec[idx]->rid == rec[file_c]->rid) && (rec[idx]->pos > rec[file_c]->pos))) idx = file_c;
+	}
+      }
+
+      // Is this record a selected representative?
+      std::string key = boost::lexical_cast<std::string>(idx) + "\t" + std::string(rec[idx]->d.id);
+      boost::unordered_map<std::string, MergeAgg>::const_iterator sit = selected.find(key);
+      if (sit != selected.end()) {
+	// Confirm SV type
+	int32_t recsvt = -1;
+	if (bcf_get_info_string(hdr[idx], rec[idx], "SVTYPE", &svt, &nsvt) > 0) {
+	  bool hasCT = (bcf_get_info_string(hdr[idx], rec[idx], "CT", &ct, &nct) > 0);
+	  recsvt = _mergeDecodeSVT(std::string(svt), hasCT, hasCT ? std::string(ct) : std::string("NA"));
+	}
+	if (recsvt == svtin) {
+	  MergeAgg const& agg = sit->second;
+	  std::string chrName(bcf_hdr_id2name(hdr[idx], rec[idx]->rid));
+	  int32_t svStart = rec[idx]->pos;
+	  int32_t svEnd = svStart + 1;
+	  if (bcf_get_info_int32(hdr[idx], rec[idx], "END", &svend, &nsvend) > 0) svEnd = *svend;
+	  int32_t inslenVal = 0;
+	  if (bcf_get_info_int32(hdr[idx], rec[idx], "INSLEN", &inslen, &ninslen) > 0) inslenVal = *inslen;
+	  if ((inslenVal == 0) && (bcf_get_info_int32(hdr[idx], rec[idx], "SVLEN", &svlen, &nsvlen) > 0)) inslenVal = std::abs(*svlen);
+
+	  bool precise = (bcf_get_info_flag(hdr[idx], rec[idx], "PRECISE", 0, 0) > 0);
+	  int32_t peSupport = 0; if (bcf_get_info_int32(hdr[idx], rec[idx], "PE", &pe, &npe) > 0) peSupport = *pe;
+	  int32_t srSupport = 0; if (bcf_get_info_int32(hdr[idx], rec[idx], "SR", &sr, &nsr) > 0) srSupport = *sr;
+	  int32_t peMapQuality = 0; if (bcf_get_info_int32(hdr[idx], rec[idx], "MAPQ", &mapq, &nmapq) > 0) peMapQuality = *mapq;
+	  int32_t srMapQuality = 0; if (bcf_get_info_int32(hdr[idx], rec[idx], "SRMAPQ", &srmapq, &nsrmapq) > 0) srMapQuality = *srmapq;
+	  int32_t homlenVal = 0; if (bcf_get_info_int32(hdr[idx], rec[idx], "HOMLEN", &homlen, &nhomlen) > 0) homlenVal = *homlen;
+	  float srAlignQuality = 0; if (bcf_get_info_float(hdr[idx], rec[idx], "SRQ", &srq, &nsrq) > 0) srAlignQuality = *srq;
+	  std::string chr2Name = chrName;
+	  int32_t pos2val = 0;
+	  if (bcf_get_info_string(hdr[idx], rec[idx], "CHR2", &chr2, &nchr2) > 0) {
+	    chr2Name = std::string(chr2);
+	    if (bcf_get_info_int32(hdr[idx], rec[idx], "POS2", &pos2, &npos2) > 0) pos2val = *pos2;
+	  } else if (svtin >= DELLY_SVT_TRANS) {
+	    // Use BND ALT
+	    std::string altStr = (rec[idx]->n_allele > 1) ? std::string(rec[idx]->d.allele[1]) : std::string();
+	    std::string mateChr; int32_t matePos = 0;
+	    if (_parseBndMate(altStr, mateChr, matePos)) { chr2Name = mateChr; pos2val = matePos; }
+	  }
+	  std::string consStr; float ceVal = 0; int32_t consBpVal = 0;
+	  if (precise) {
+	    if (bcf_get_info_float(hdr[idx], rec[idx], "CE", &ce, &nce) > 0) ceVal = *ce;
+	    if (bcf_get_info_string(hdr[idx], rec[idx], "CONSENSUS", &cons, &ncons) > 0) consStr = boost::to_upper_copy(std::string(cons));
+	    if (bcf_get_info_int32(hdr[idx], rec[idx], "CONSBP", &consbp, &nconsbp) > 0) consBpVal = *consbp;
+	  }
+	  std::string subStr; if (bcf_get_info_string(hdr[idx], rec[idx], "SUBTYPE", &sub, &nsub) > 0) subStr = std::string(sub);
+	  std::string insStr; if (bcf_get_info_string(hdr[idx], rec[idx], "INSSTRAND", &instr, &nins) > 0) insStr = std::string(instr);
+	  int32_t trPeriodVal = 0; bool hasTrp = (bcf_get_info_int32(hdr[idx], rec[idx], "TRPERIOD", &trp, &ntrp) > 0); if (hasTrp) trPeriodVal = *trp;
+	  float trCopiesVal = 0; bool hasTrc = (bcf_get_info_float(hdr[idx], rec[idx], "TRCOPIES", &trc, &ntrc) > 0); if (hasTrc) trCopiesVal = *trc;
+
+	  // Synthesize consensus (if needed)
+	  if ((fai != NULL) && (consStr.empty()) && ((svtin == 2) || (svtin == 4))) {
+	    std::string insSeq;
+	    bool canSynth = true;
+	    if (svtin == 4) {
+	      std::string altIn = (rec[idx]->n_allele > 1) ? std::string(rec[idx]->d.allele[1]) : std::string();
+	      if ((!altIn.empty()) && (altIn[0] != '<') && (altIn.size() > 1)) insSeq = altIn.substr(1);
+	      else canSynth = false;  // need an explicit inserted sequence
+	    }
+	    if (canSynth) {
+	      int32_t rsvEnd = (svtin == 4) ? (rec[idx]->pos + 1) : svEnd;
+	      std::string synthCons; int32_t synthBp = 0; int32_t synthInsLen = 0;
+	      if (_synthConsensus(fai, chrName, svtin, rec[idx]->pos, rsvEnd, insSeq, synthCons, synthBp, synthInsLen)) {
+		consStr = synthCons;
+		consBpVal = synthBp;
+		inslenVal = synthInsLen;
+		precise = true;
+		ceVal = entropy(consStr);
+		if (svtin == 4) svEnd = rsvEnd;
+	      }
+	    }
+	  }
+
+	  // Build the output record
+	  rout->rid = bcf_hdr_name2id(hdr_out, chrName.c_str());
+	  rout->pos = rec[idx]->pos;
+	  rout->qual = rec[idx]->qual;
+	  std::string id;
+	  if (c.files.size() == 1) id = std::string(rec[idx]->d.id);
+	  else {
+	    id += _addID(svtin);
+	    std::string padNumber = boost::lexical_cast<std::string>(c.svcounter++);
+	    padNumber.insert(padNumber.begin(), 8 - padNumber.length(), '0');
+	    id += padNumber;
+	  }
+	  bcf_update_id(hdr_out, rout, id.c_str());
+	  std::string refAllele = rec[idx]->d.allele[0];
+	  std::string altAllele = (rec[idx]->n_allele > 1) ? std::string(rec[idx]->d.allele[1]) : std::string("<") + _addID(svtin) + ">";
+	  std::string alleles = refAllele + "," + altAllele;
+	  bcf_update_alleles_str(hdr_out, rout, alleles.c_str());
+	  int32_t tmppass = bcf_hdr_id2int(hdr_out, BCF_DT_ID, "PASS");
+	  bcf_update_filter(hdr_out, rout, &tmppass, 1);
+	  
+	  if (precise) bcf_update_info_flag(hdr_out, rout, "PRECISE", NULL, 1);
+	  else bcf_update_info_flag(hdr_out, rout, "IMPRECISE", NULL, 1);
+	  bcf_update_info_string(hdr_out, rout, "SVTYPE", _addID(svtin).c_str());
+	  std::string dellyVersion("EMBL.DELLYv");
+	  dellyVersion += dellyVersionNumber;
+	  bcf_update_info_string(hdr_out, rout, "SVMETHOD", dellyVersion.c_str());
+	  if (recsvt == 4) bcf_update_info_int32(hdr_out, rout, "END", &svEnd, 1);
+	  else bcf_update_info_int32(hdr_out, rout, "END", &svEnd, 1);
+	  if (svtin >= DELLY_SVT_TRANS) {
+	    bcf_update_info_string(hdr_out, rout, "CHR2", chr2Name.c_str());
+	    bcf_update_info_int32(hdr_out, rout, "POS2", &pos2val, 1);
+	  }
+	  if (svtin < DELLY_SVT_TRANS) {
+	    int32_t svlenOut;
+	    if (svtin == 4) svlenOut = inslenVal;
+	    else if (svtin == 2) svlenOut = svStart - svEnd;
+	    else svlenOut = svEnd - svStart;
+	    bcf_update_info_int32(hdr_out, rout, "SVLEN", &svlenOut, 1);
+	  }
+	  bcf_update_info_int32(hdr_out, rout, "PE", &peSupport, 1);
+	  int32_t tmpi = peMapQuality;
+	  bcf_update_info_int32(hdr_out, rout, "MAPQ", &tmpi, 1);
+	  bcf_update_info_string(hdr_out, rout, "CT", _addOrientation(svtin).c_str());
+	  
+	  // Confidence intervals from the observed breakpoint spread
+	  int32_t cipos[2]; cipos[0] = agg.ciposLo; cipos[1] = agg.ciposHi;
+	  int32_t ciend[2]; ciend[0] = agg.ciendLo; ciend[1] = agg.ciendHi;
+	  bcf_update_info_int32(hdr_out, rout, "CIPOS", cipos, 2);
+	  bcf_update_info_int32(hdr_out, rout, "CIEND", ciend, 2);
+	  
+	  if (precise) {
+	    tmpi = srMapQuality;
+	    bcf_update_info_int32(hdr_out, rout, "SRMAPQ", &tmpi, 1);
+	    bcf_update_info_int32(hdr_out, rout, "INSLEN", &inslenVal, 1);
+	    bcf_update_info_int32(hdr_out, rout, "HOMLEN", &homlenVal, 1);
+	    bcf_update_info_int32(hdr_out, rout, "SR", &srSupport, 1);
+	    bcf_update_info_float(hdr_out, rout, "SRQ", &srAlignQuality, 1);
+	    if (consStr.size()) {
+	      bcf_update_info_string(hdr_out, rout, "CONSENSUS", consStr.c_str());
+	      bcf_update_info_float(hdr_out, rout, "CE", &ceVal, 1);
+	      bcf_update_info_int32(hdr_out, rout, "CONSBP", &consBpVal, 1);
+	    }
+	  }
+	  
+	  // SV subtyping
+	  if (c.annotated) {
+	    if (!subStr.empty()) bcf_update_info_string(hdr_out, rout, "SUBTYPE", subStr.c_str());
+	    if (!insStr.empty()) bcf_update_info_string(hdr_out, rout, "INSSTRAND", insStr.c_str());
+	    if (hasTrp) bcf_update_info_int32(hdr_out, rout, "TRPERIOD", &trPeriodVal, 1);
+	    if (hasTrc) bcf_update_info_float(hdr_out, rout, "TRCOPIES", &trCopiesVal, 1);
+	  }
+	  if (agg.trStart >= 0) {
+	    int32_t trs = agg.trStart + 1;
+	    int32_t tre = agg.trEnd;
+	    bcf_update_info_int32(hdr_out, rout, "TRSTART", &trs, 1);
+	    bcf_update_info_int32(hdr_out, rout, "TREND", &tre, 1);
+	  }
+
+	  // Population AF priors
+	  int32_t acOut = agg.ac;
+	  int32_t anOut = agg.an;
+	  int32_t suppOut = agg.supp;
+	  int32_t alleleIdOut = (int32_t) agg.alleleId;
+	  int32_t nAlleleOut = agg.nAllele;
+	  float afOut = (anOut > 0) ? ((float) acOut / (float) anOut) : 0;
+	  bcf_update_info_int32(hdr_out, rout, "AC", &acOut, 1);
+	  bcf_update_info_int32(hdr_out, rout, "AN", &anOut, 1);
+	  bcf_update_info_float(hdr_out, rout, "AF", &afOut, 1);
+	  bcf_update_info_int32(hdr_out, rout, "SUPP", &suppOut, 1);
+	  bcf_update_info_int32(hdr_out, rout, "ALLELEID", &alleleIdOut, 1);
+	  bcf_update_info_int32(hdr_out, rout, "NALLELE", &nAlleleOut, 1);
+
+	  bcf_write1(fp, hdr_out, rout);
+	  bcf_clear1(rout);
+	}
+      }
+      
+      if (bcf_read(ifile[idx], hdr[idx], rec[idx]) == 0) bcf_unpack(rec[idx], BCF_UN_INFO);
+      else { ++allEOF; eof[idx] = true; }
+    }
+    if (svend != NULL) free(svend);
+    if (pe != NULL) free(pe);
+    if (sr != NULL) free(sr);
+    if (homlen != NULL) free(homlen);
+    if (inslen != NULL) free(inslen);
+    if (svlen != NULL) free(svlen);
+    if (pos2 != NULL) free(pos2);
+    if (consbp != NULL) free(consbp);
+    if (mapq != NULL) free(mapq);
+    if (srmapq != NULL) free(srmapq);
+    if (ct != NULL) free(ct);
+    if (srq != NULL) free(srq);
+    if (svt != NULL) free(svt);
+    if (chr2 != NULL) free(chr2);
+    if (ce != NULL) free(ce);
+    if (cons != NULL) free(cons);
+    if (sub != NULL) free(sub);
+    if (instr != NULL) free(instr);
+    if (trp != NULL) free(trp);
+    if (trc != NULL) free(trc);
+
+    for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+      bcf_hdr_destroy(hdr[file_c]);
+      bcf_close(ifile[file_c]);
+      bcf_destroy(rec[file_c]);
+    }
+    bcf_destroy(rout);
+    bcf_hdr_destroy(hdr_out);
+    hts_close(fp);
+    if (fai != NULL) fai_destroy(fai);
+
+    if (c.outfile.string() != "-") bcf_index_build(c.outfile.string().c_str(), 14);
+  }
+
+
+  template<typename TGenomeIntervals, typename TContigMap>
+  void _outputSelectedIntervalsCNVs(MergeConfig& c, TGenomeIntervals const& iSelected, TContigMap& cMap) {
+    typedef typename TGenomeIntervals::value_type TIntervalScores;
+    typedef typename TIntervalScores::value_type IntervalScore;
+    
+    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+    std::cerr << '[' << boost::posix_time::to_simple_string(now) << "] " << "Filtering SVs" << std::endl;
+    
+    // Open output VCF file
+    std::string fmtout = "wb";
+    if (c.outfile.string() == "-") fmtout = "w";
+    htsFile *fp = hts_open(c.outfile.string().c_str(), fmtout.c_str());
+    bcf_hdr_t *hdr_out = bcf_hdr_init("w");
+    
+    // Write VCF header
+    boost::gregorian::date today = now.date();
+    std::string datestr("##fileDate=");
+    datestr += boost::gregorian::to_iso_string(today);
+    bcf_hdr_append(hdr_out, datestr.c_str());
+    bcf_hdr_append(hdr_out, "##ALT=<ID=CNV,Description=\"copy-number variants\">");
+    bcf_hdr_append(hdr_out, "##FILTER=<ID=LowQual,Description=\"Poor quality copy-number variant\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=CIEND,Number=2,Type=Integer,Description=\"Confidence interval around END\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=CIPOS,Number=2,Type=Integer,Description=\"Confidence interval around POS\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the copy-number variant\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=MP,Number=1,Type=Float,Description=\"Mappable fraction of CNV\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=UNIQ,Number=1,Type=Float,Description=\"Uniquely-mappable fraction\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SRL,Number=1,Type=Integer,Description=\"Split-read support at the left breakpoint\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SRR,Number=1,Type=Integer,Description=\"Split-read support at the right breakpoint\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SUPPLOSS,Number=1,Type=Integer,Description=\"Number of samples supporting a loss\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SUPPGAIN,Number=1,Type=Integer,Description=\"Number of samples supporting a gain\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"Imprecise copy-number variant\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=PRECISE,Number=0,Type=Flag,Description=\"Precise copy-number variant\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">");
+    bcf_hdr_append(hdr_out, "##INFO=<ID=SVMETHOD,Number=1,Type=String,Description=\"Type of approach used to detect CNV\">");
+    
+    // Add reference contigs
+    uint32_t numseq = 0;
+    typedef std::map<uint32_t, std::string> TReverseMap;
+    TReverseMap rMap;
+    for(typename TContigMap::iterator cIt = cMap.begin(); cIt != cMap.end(); ++cIt, ++numseq) rMap[cIt->second] = cIt->first;
+    for(typename TReverseMap::iterator rIt = rMap.begin(); rIt != rMap.end(); ++rIt) {
+      std::string refname("##contig=<ID=");
+      refname += rIt->second + ">";
+      bcf_hdr_append(hdr_out, refname.c_str());
+    }
+    bcf_hdr_add_sample(hdr_out, NULL);
+    if (bcf_hdr_write(fp, hdr_out) != 0) std::cerr << "Error: Failed to write BCF header!" << std::endl;
+    
+    // Duplicate filter (identical start, end, score values)
+    typedef std::pair<uint32_t, uint32_t> TStartEnd;
+    typedef std::set<TStartEnd> TIntervalSet;
+    typedef std::vector<TIntervalSet> TGenomicIntervalSet;
+    TGenomicIntervalSet gis(numseq);
+    
+    // Parse input VCF files
+    bcf1_t *rout = bcf_init();
+    typedef std::vector<htsFile*> THtsFile;
+    typedef std::vector<bcf_hdr_t*> TBcfHeader;
+    typedef std::vector<bcf1_t*> TBcfRecord;
+    typedef std::vector<bool> TEof;
+    THtsFile ifile(c.files.size());
+    TBcfHeader hdr(c.files.size());
+    TBcfRecord rec(c.files.size());
+    TEof eof(c.files.size());
+    uint32_t allEOF = 0;
+    for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+      ifile[file_c] = bcf_open(c.files[file_c].string().c_str(), "r");
+      hdr[file_c] = bcf_hdr_read(ifile[file_c]);
+      if (bcf_hdr_set_samples(hdr[file_c], NULL, false) != 0) std::cerr << "Error: Failed to set sample information!" << std::endl;
+      rec[file_c] = bcf_init();
+      if (bcf_read(ifile[file_c], hdr[file_c], rec[file_c]) == 0) {
+	bcf_unpack(rec[file_c], BCF_UN_INFO);
+	eof[file_c] = false;
+      } else {
+	++allEOF;
+	eof[file_c] = true;
+      }
+    }
+    
+    int32_t nsvend = 0;
+    int32_t* svend = NULL;
+    int32_t nmp = 0;
+    float* mp = NULL;
+    int32_t nsvt = 0;
+    char* svt = NULL;
+    int32_t ncipos = 0;
+    int32_t* cipos = NULL;
+    int32_t nciend = 0;
+    int32_t* ciend = NULL;
+    while (allEOF < c.files.size()) {
+      // Find next sorted record
+      int32_t idx = -1;
+      for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+	if (!eof[file_c]) {
+	  if ((idx < 0) || (rec[idx]->rid > rec[file_c]->rid) || ((rec[idx]->rid == rec[file_c]->rid) && (rec[idx]->pos > rec[file_c]->pos))) idx = file_c;
+	}
+      }
+      
+      // Correct SV type
+      int32_t recsvt = -1;
+      if (bcf_get_info_string(hdr[idx], rec[idx], "SVTYPE", &svt, &nsvt) > 0) recsvt = _decodeOrientation(std::string("NA"), std::string(svt));
+      // CNV ?
+      if (recsvt == 9) {
+	// Check PASS
+	bool pass = true;
+	if (c.filterForPass) pass = (bcf_has_filter(hdr[idx], rec[idx], const_cast<char*>("PASS"))==1);
+	
+	// Check PRECISE
+	bool precise = false;
+	bool passPrecise = true;
+	if (bcf_get_info_flag(hdr[idx], rec[idx], "PRECISE", 0, 0) > 0) precise=true;
+	if ((c.filterForPrecise) && (!precise)) passPrecise = false;	
+	if ((passPrecise) && (pass)) {
+	  // Correct size
+	  std::string chrName(bcf_hdr_id2name(hdr[idx], rec[idx]->rid));
+	  uint32_t tid = cMap[chrName];
+	  uint32_t svStart = rec[idx]->pos;
+	  uint32_t svEnd = svStart + 1;
+	  if (bcf_get_info_int32(hdr[idx], rec[idx], "END", &svend, &nsvend) > 0) svEnd = *svend;
+	  
+	  // Parse INFO fields
+	  if ((svEnd - svStart >= c.minsize) && (svEnd - svStart <= c.maxsize)) {
+	    int32_t score = rec[idx]->qual;
+	    
+	    // Is this a selected interval
+	    typename TIntervalScores::const_iterator iter = std::lower_bound(iSelected[tid].begin(), iSelected[tid].end(), IntervalScore(svStart, svEnd, score));
+	    bool foundInterval = false;
+	    int32_t suppLoss = 0;
+	    int32_t suppGain = 0;
+	    int32_t srlval = 0;
+	    int32_t srrval = 0;
+	    float uniqval = -1;
+	    for(; (iter != iSelected[tid].end()) && (iter->start == svStart); ++iter) {
+	      if ((iter->start == svStart) && (iter->end == svEnd) && (iter->score == score)) {
+		// Duplicate?
+		if (gis[tid].find(std::make_pair(svStart, svEnd)) == gis[tid].end()) {
+		  foundInterval = true;
+		  suppLoss = iter->suppLoss;
+		  suppGain = iter->suppGain;
+		  srlval = iter->srl;
+		  srrval = iter->srr;
+		  uniqval = iter->uniq;
+		  gis[tid].insert(std::make_pair(svStart, svEnd));
+		}
+		break;
+	      }
+	    }
+	    if (foundInterval) {
+	      // Fetch missing INFO fields
+	      bcf_get_info_int32(hdr[idx], rec[idx], "CIPOS", &cipos, &ncipos);
+	      bcf_get_info_int32(hdr[idx], rec[idx], "CIEND", &ciend, &nciend);
+	      float mpval = 0;
+	      if (bcf_get_info_float(hdr[idx], rec[idx], "MP", &mp, &nmp) > 0) mpval = *mp;
+	      // precise, split-reads at both breakpoints
+	      precise = ((srlval > 0) && (srrval > 0));
+
+	      // Create new record
+	      rout->rid = bcf_hdr_name2id(hdr_out, chrName.c_str());
+	      rout->pos = rec[idx]->pos;
+	      rout->qual = rec[idx]->qual;
+	      std::string id;
+	      if (c.files.size() == 1) id = std::string(rec[idx]->d.id); // Within one VCF file IDs are unique
+	      else {
+		id += _addID(recsvt);
+		std::string padNumber = boost::lexical_cast<std::string>(c.svcounter++);
+		padNumber.insert(padNumber.begin(), 8 - padNumber.length(), '0');
+		id += padNumber;
+	      }
+	      bcf_update_id(hdr_out, rout, id.c_str());
+	      std::string refAllele = rec[idx]->d.allele[0];
+	      std::string altAllele = rec[idx]->d.allele[1];
+	      std::string alleles = refAllele + "," + altAllele;
+	      bcf_update_alleles_str(hdr_out, rout, alleles.c_str());
+	      int32_t tmppass = bcf_hdr_id2int(hdr_out, BCF_DT_ID, "PASS");
+	      bcf_update_filter(hdr_out, rout, &tmppass, 1);
+	      
+	      // Add INFO fields
+	      if (precise) bcf_update_info_flag(hdr_out, rout, "PRECISE", NULL, 1);
+	      else bcf_update_info_flag(hdr_out, rout, "IMPRECISE", NULL, 1);
+	      bcf_update_info_string(hdr_out, rout, "SVTYPE", _addID(recsvt).c_str());
+	      std::string dellyVersion("EMBL.DELLYv");
+	      dellyVersion += dellyVersionNumber;
+	      bcf_update_info_string(hdr_out,rout, "SVMETHOD", dellyVersion.c_str());
+	      bcf_update_info_int32(hdr_out, rout, "END", &svEnd, 1);
+	      bcf_update_info_int32(hdr_out, rout, "CIPOS", cipos, 2);
+	      bcf_update_info_int32(hdr_out, rout, "CIEND", ciend, 2);
+	      bcf_update_info_float(hdr_out, rout, "MP", &mpval, 1);
+	      bcf_update_info_float(hdr_out, rout, "UNIQ", &uniqval, 1);
+	      bcf_update_info_int32(hdr_out, rout, "SRL", &srlval, 1);
+	      bcf_update_info_int32(hdr_out, rout, "SRR", &srrval, 1);
+	      bcf_update_info_int32(hdr_out, rout, "SUPPLOSS", &suppLoss, 1);
+	      bcf_update_info_int32(hdr_out, rout, "SUPPGAIN", &suppGain, 1);
+
+	      // Write record
+	      bcf_write1(fp, hdr_out, rout);
+	      bcf_clear1(rout);
+	    }
+	  }
+	}
+      }
+      
+      // Fetch next record
+      if (bcf_read(ifile[idx], hdr[idx], rec[idx]) == 0) bcf_unpack(rec[idx], BCF_UN_INFO);
+      else {
+	++allEOF;
+	eof[idx] = true;
+      }
+    }
+    if (svend != NULL) free(svend);
+    if (mp != NULL) free(mp);
+    if (svt != NULL) free(svt);
+    if (cipos != NULL) free(cipos);
+    if (ciend != NULL) free(ciend);
+
+    // Clean-up
+    for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+      bcf_hdr_destroy(hdr[file_c]);
+      bcf_close(ifile[file_c]);
+      bcf_destroy(rec[file_c]);
+    }
+    
+    // Close VCF file
+    bcf_destroy(rout);
+    bcf_hdr_destroy(hdr_out);
+    hts_close(fp);
+    
+    // Build index
+    if (c.outfile.string() != "-") bcf_index_build(c.outfile.string().c_str(), 14);
+  }
+
+
+  // CNVs
+  struct IntervalScore {
+    uint32_t start;
+    uint32_t end;
+    int32_t score;
+    int32_t cn;
+    int32_t srl;
+    int32_t srr;
+    float uniq;
+    int32_t suppLoss;
+    int32_t suppGain;
+
+    IntervalScore(uint32_t s, uint32_t e, int32_t c) : start(s), end(e), score(c), cn(2), srl(0), srr(0), uniq(-1), suppLoss(0), suppGain(0) {}
+
+    bool precise() const {
+      return ((srl > 0) && (srr > 0));
+    }
+
+    bool operator<(const IntervalScore& s2) const {
+      return ((start < s2.start) || ((start == s2.start) && (end < s2.end)));
+    }
+  };
+  
+  template<typename TGenomeIntervals, typename TContigMap>
+  void _fillCNVIntervalMap(MergeConfig const& c, TGenomeIntervals& iScore, TContigMap& cMap) {
+    std::vector<int32_t> winvals;
+    for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+      htsFile* ifile = bcf_open(c.files[file_c].string().c_str(), "r");
+      bcf_hdr_t* hdr = bcf_hdr_read(ifile);
+      bcf1_t* rec = bcf_init();
+      int32_t nsvend = 0;
+      int32_t* svend = NULL;
+      int32_t nsvt = 0;
+      char* svt = NULL;
+      int32_t nsrl = 0;
+      int32_t* srl = NULL;
+      int32_t nsrr = 0;
+      int32_t* srr = NULL;
+      int32_t nuniq = 0;
+      float* uniq = NULL;
+      int32_t ncn = 0;
+      int32_t* cn = NULL;
+      int32_t nwin = 0;
+      int32_t* win = NULL;
+      while (bcf_read(ifile, hdr, rec) == 0) {
+	bcf_unpack(rec, BCF_UN_ALL);
+	bool pass = true;
+	if (c.filterForPass) pass = (bcf_has_filter(hdr, rec, const_cast<char*>("PASS"))==1);
+	if (!pass) continue;
+	int32_t recsvt = -1;
+	if (bcf_get_info_string(hdr, rec, "SVTYPE", &svt, &nsvt) > 0) recsvt = _decodeOrientation(std::string("NA"), std::string(svt));
+	if (recsvt != 9) continue;
+	std::string chrName(bcf_hdr_id2name(hdr, rec->rid));
+	uint32_t tid = cMap[chrName];
+	uint32_t svStart = rec->pos;
+	uint32_t svEnd = rec->pos + 2;
+	if (bcf_get_info_int32(hdr, rec, "END", &svend, &nsvend) > 0) svEnd = *svend;
+	if ((svEnd - svStart < c.minsize) || (svEnd - svStart > c.maxsize)) continue;
+	if (bcf_get_info_int32(hdr, rec, "WINDOW", &win, &nwin) > 0) {
+	  if (*win > 0) winvals.push_back(*win);
+	}
+	bool precise = false;
+	if (bcf_get_info_flag(hdr, rec, "PRECISE", 0, 0) > 0) precise=true;
+	if ((c.filterForPrecise) && (!precise)) continue;
+	IntervalScore ivs(svStart, svEnd, rec->qual);
+	if (bcf_get_format_int32(hdr, rec, "CN", &cn, &ncn) > 0) ivs.cn = cn[0];
+	if (bcf_get_info_int32(hdr, rec, "SRL", &srl, &nsrl) > 0) ivs.srl = *srl;
+	if (bcf_get_info_int32(hdr, rec, "SRR", &srr, &nsrr) > 0) ivs.srr = *srr;
+	if (bcf_get_info_float(hdr, rec, "UNIQ", &uniq, &nuniq) > 0) ivs.uniq = *uniq;
+	iScore[tid].push_back(ivs);
+      }
+      if (svend != NULL) free(svend);
+      if (svt != NULL) free(svt);
+      if (srl != NULL) free(srl);
+      if (srr != NULL) free(srr);
+      if (uniq != NULL) free(uniq);
+      if (cn != NULL) free(cn);
+      if (win != NULL) free(win);
+      bcf_hdr_destroy(hdr);
+      bcf_close(ifile);
+      bcf_destroy(rec);
+    }
+    // Drop small CNVs based on auto-window
+    if ((c.cnvMinWindows > 0) && (!winvals.empty())) {
+      std::sort(winvals.begin(), winvals.end());
+      int32_t medWin = winvals[winvals.size() / 2];
+      int32_t minCnvSize = c.cnvMinWindows * medWin;
+      for(unsigned int tid = 0; tid < iScore.size(); ++tid) {
+	typename TGenomeIntervals::value_type kept;
+	for(typename TGenomeIntervals::value_type::const_iterator it = iScore[tid].begin(); it != iScore[tid].end(); ++it) {
+	  if ((int32_t) (it->end - it->start) >= minCnvSize) kept.push_back(*it);
+	}
+	iScore[tid].swap(kept);
+      }
+    }
+  }
+
+  template<typename TGenomeIntervals>
+  void _processCNVIntervalMap(MergeConfig const& c, TGenomeIntervals const& iScore, TGenomeIntervals& iSelected) {
+    unsigned int seqId = 0;
+    for(typename TGenomeIntervals::const_iterator iG = iScore.begin(); iG != iScore.end(); ++iG, ++seqId) {
+      // Cluster overlapping calls
+      std::size_t n = iG->size();
+      std::vector<bool> used(n, false);
+      for(std::size_t i = 0; i < n; ++i) {
+	if (used[i]) continue;
+	IntervalScore const& lead = (*iG)[i];
+	std::size_t repIdx = i;
+	int32_t suppLoss = 0;
+	int32_t suppGain = 0;
+	bool preciseLoss = false;
+	bool preciseGain = false;
+	float bestUniq = -1;
+	int32_t bestSrl = 0;
+	int32_t bestSrr = 0;
+	int32_t cnvWin = std::max((int32_t) c.bpoffset, (int32_t) (c.normFrac * (lead.end - lead.start)));
+	for(std::size_t j = i; j < n; ++j) {
+	  if (used[j]) continue;
+	  IntervalScore const& cur = (*iG)[j];
+	  if ((int32_t) (cur.start - lead.start) > cnvWin) break;
+	  // Overlap?
+	  if (j != i) {
+	    int32_t endOff = (cur.end > lead.end) ? (cur.end - lead.end) : (lead.end - cur.end);
+	    if ((endOff >= cnvWin) || (recOverlap(lead.start, lead.end, cur.start, cur.end) < c.recoverlap)) continue;
+	  }
+	  used[j] = true;
+	  if (cur.cn < 2) {
+	    ++suppLoss;
+	    if (cur.precise()) preciseLoss = true;
+	  }
+	  else if (cur.cn > 2) {
+	    ++suppGain;
+	    if (cur.precise()) preciseGain = true;
+	  }
+	  if (cur.uniq > bestUniq) bestUniq = cur.uniq;
+	  if (cur.srl > bestSrl) bestSrl = cur.srl;
+	  if (cur.srr > bestSrr) bestSrr = cur.srr;
+	  if (cur.score > (*iG)[repIdx].score) repIdx = j;
+	}
+	IntervalScore const& rep = (*iG)[repIdx];
+	int32_t size = (int32_t) (rep.end - rep.start);
+	bool lossOk = (suppLoss >= c.recurrentSamples) || (suppLoss >= c.cnvMinCarriers) || preciseLoss || (size >= c.cnvLargeSize) || ((rep.score >= c.qualthres) && (bestUniq >= c.cnvMinUniq));
+	bool gainOk = preciseGain || ((suppGain >= c.recurrentSamples) && (bestUniq >= c.cnvGainUniq));
+	if ((lossOk) || (gainOk)) {
+	  IntervalScore keep(rep.start, rep.end, rep.score);
+	  keep.suppLoss = suppLoss;
+	  keep.suppGain = suppGain;
+	  keep.srl = bestSrl;
+	  keep.srr = bestSrr;
+	  keep.uniq = bestUniq;
+	  iSelected[seqId].push_back(keep);
+	}
+      }
+      std::sort(iSelected[seqId].begin(), iSelected[seqId].end());
+    }
+  }
+
+  // Group loci that req. multi-allelic genotyping
+  inline void
+  _regroupLoci(MergeConfig& c, std::vector<boost::filesystem::path> const& cts, std::vector<std::vector<int32_t> >& newAid, std::vector<std::vector<int32_t> >& newNal, std::vector<std::vector<int32_t> >& newTrs, std::vector<std::vector<int32_t> >& newTre) {
+    struct PostAllele {
+      int32_t rid;
+      int32_t pos;
+      int32_t end;
+      int32_t svt;
+      int32_t ac;
+      int32_t trperiod;
+      bool tr;
+      int32_t trs;
+      int32_t tre;
+      int32_t f;
+      int32_t k;
+    };
+    
+    std::vector<PostAllele> als;
+    newAid.assign(cts.size(), std::vector<int32_t>());
+    newNal.assign(cts.size(), std::vector<int32_t>());
+    newTrs.assign(cts.size(), std::vector<int32_t>());
+    newTre.assign(cts.size(), std::vector<int32_t>());
+    for(size_t f = 0; f < cts.size(); ++f) {
+      htsFile* ifile = bcf_open(cts[f].string().c_str(), "r");
+      bcf_hdr_t* hdr = bcf_hdr_read(ifile);
+      bcf1_t* rec = bcf_init();
+      int32_t nend = 0;
+      int32_t ntrp = 0;
+      int32_t nac = 0;
+      int32_t nsvt = 0;
+      int32_t nsub = 0;
+      int32_t ntrs = 0;
+      int32_t ntre = 0;
+      int32_t *trsp = NULL;
+      int32_t *trep = NULL;
+      int32_t *endp = NULL;
+      int32_t *trpp = NULL;
+      int32_t *acp = NULL;
+      char *svtc = NULL;
+      char *subc = NULL;
+      int32_t kk = 0;
+      while (bcf_read(ifile, hdr, rec) == 0) {
+	bcf_unpack(rec, BCF_UN_INFO);
+	int32_t end = rec->pos + 1;
+	if (bcf_get_info_int32(hdr, rec, "END", &endp, &nend) > 0) end = *endp;
+	int32_t svt = 5;
+	if (bcf_get_info_string(hdr, rec, "SVTYPE", &svtc, &nsvt) > 0) {
+	  std::string s(svtc);
+	  if (s == "DEL") svt = 2;
+	  else if (s == "INS") svt = 4;
+	  else if (s == "DUP") svt = 3;
+	  else if (s == "INV") svt = 0;
+	}
+	bool tr = false;
+	if (bcf_get_info_string(hdr, rec, "SUBTYPE", &subc, &nsub) > 0) {
+	  std::string subs(subc);
+	  if ((c.longread) && (c.hasGenome)) {
+	    if ((subs == "INS:TR") || (subs == "DEL:TR")) tr = true;
+	  } else if (subs.find("TR") != std::string::npos) tr = true;
+	}
+	int32_t trs = -1;
+	int32_t tre = -1;
+	if (bcf_get_info_int32(hdr, rec, "TRSTART", &trsp, &ntrs) > 0) trs = *trsp - 1;
+	if (bcf_get_info_int32(hdr, rec, "TREND", &trep, &ntre) > 0) tre = *trep;
+	if ((trs >= 0) && (tre > trs)) tr = true;
+	else {
+	  trs = -1;
+	  tre = -1;
+	}
+	int32_t trperiod = 0;
+	if (bcf_get_info_int32(hdr, rec, "TRPERIOD", &trpp, &ntrp) > 0) {
+	  trperiod = *trpp;
+	  if (trperiod > 0) tr = true;
+	}
+	int32_t ac = 0;
+	if (bcf_get_info_int32(hdr, rec, "AC", &acp, &nac) > 0) ac = *acp;
+	PostAllele pa;
+	pa.rid = rec->rid;
+	pa.pos = rec->pos;
+	pa.end = end;
+	pa.svt = svt;
+	pa.ac = ac;
+	pa.trperiod = ((trperiod < 0) || (trperiod > 10000)) ? 0 : trperiod;
+	pa.tr = tr;
+	pa.trs = trs;
+	pa.tre = tre;
+	pa.f = (int32_t) f;
+	pa.k = kk;
+	als.push_back(pa);
+	newAid[f].push_back(-1);
+	newNal[f].push_back(1);
+	newTrs[f].push_back(-1);
+	newTre[f].push_back(-1);
+	++kk;
+      }
+      if (endp) free(endp);
+      if (trsp) free(trsp);
+      if (trep) free(trep);
+      if (trpp) free(trpp);
+      if (acp) free(acp);
+      if (svtc) free(svtc);
+      if (subc) free(subc);
+
+      // Clean-up
+      bcf_destroy(rec);
+      bcf_hdr_destroy(hdr);
+      bcf_close(ifile);
+    }
+
+    int32_t N = (int32_t) als.size();
+    if (N == 0) return;
+    std::vector<int32_t> ord(N);
+    for(int32_t i = 0; i < N; ++i) ord[i] = i;
+    std::sort(ord.begin(), ord.end(), [&](int32_t a, int32_t b) { return (als[a].rid < als[b].rid) || ((als[a].rid == als[b].rid) && (als[a].pos < als[b].pos)); });
+
+    UnionFind uf(N);
+    double twoN = 2.0 * (double) c.totalSamples;
+    int32_t sweepCap = std::max((int32_t) c.bpoffset, 5000);
+    int32_t maxSpan = 10000; // max. STR/VNTR size
+    std::vector<int32_t> compMin(N);
+    std::vector<int32_t> compMax(N);
+    for(int32_t i = 0; i < N; ++i) {
+      compMin[i] = als[i].pos;
+      compMax[i] = als[i].pos;
+    }
+    auto tryUnite = [&](int32_t i, int32_t j) {
+      int32_t ri = uf.find(i), rj = uf.find(j);
+      if (ri == rj) return;
+      int32_t mn = std::min(compMin[ri], compMin[rj]);
+      int32_t mx = std::max(compMax[ri], compMax[rj]);
+      if (mx - mn > maxSpan) return; // keep separate
+      uf.unite(i, j);
+      int32_t r = uf.find(i);
+      compMin[r] = mn;
+      compMax[r] = mx;
+    };
+    for(int32_t oi = 0; oi < N; ++oi) {
+      int32_t i = ord[oi];
+      for(int32_t oj = oi - 1; oj >= 0; --oj) {
+	int32_t j = ord[oj];
+	if (als[j].rid != als[i].rid) break;
+	if (als[i].pos - als[j].pos > sweepCap) break;
+	bool overlap = (als[i].pos <= als[j].end) && (als[j].pos <= als[i].end);
+	if ((als[i].tr) && (als[j].tr)) {
+	  if ((als[i].trs >= 0) && (als[j].trs >= 0)) {
+	    // Both in the same repeat
+	    int32_t ovl = std::min(als[i].tre, als[j].tre) - std::max(als[i].trs, als[j].trs);
+	    int32_t shorter = std::min(als[i].tre - als[i].trs, als[j].tre - als[j].trs);
+	    if (2 * ovl >= shorter) tryUnite(i, j);
+	  } else {
+	    int32_t W = std::max((int32_t) c.bpoffset, 2 * std::max(als[i].trperiod, als[j].trperiod));
+	    if (((als[i].pos - als[j].pos) <= W) || (overlap)) tryUnite(i, j);
+	  }
+	} else if ((als[i].tr) || (als[j].tr)) {
+	  // One side is TR
+	  int32_t nonSpan = (als[i].tr) ? (als[j].end - als[j].pos) : (als[i].end - als[i].pos);
+	  int32_t trs = (als[i].tr) ? als[i].trs : als[j].trs;
+	  int32_t tre = (als[i].tr) ? als[i].tre : als[j].tre;
+	  int32_t cap = (trs >= 0) ? ((tre - trs) + 1000) : maxSpan;
+	  if ((overlap) && (nonSpan <= cap)) tryUnite(i, j);
+	} else if (als[i].svt == als[j].svt) {
+	  // Non-TR
+	  if (overlap) {
+	    // Compount hets expected?
+	    double E = (twoN > 0.0) ? ((double) als[i].ac * (double) als[j].ac / twoN) : 0.0;
+	    if (E >= 1.0) tryUnite(i, j);
+	  }
+	}
+      }
+    }
+
+    boost::unordered_map<int32_t, int32_t> rootCount;
+    for(int32_t i = 0; i < N; ++i) rootCount[uf.find(i)] += 1;
+
+    // Alleles without TR inside a repeat
+    if ((c.longread) && (c.hasGenome)) {
+      typedef std::pair<int32_t, int32_t> TTract;
+      boost::unordered_map<int32_t, std::vector<TTract> > rootTracts;
+      for(int32_t i = 0; i < N; ++i) {
+	if (als[i].trs >= 0) rootTracts[uf.find(i)].push_back(std::make_pair(als[i].trs, als[i].tre));
+      }
+      for(boost::unordered_map<int32_t, std::vector<TTract> >::iterator it = rootTracts.begin(); it != rootTracts.end(); ++it) {
+	std::vector<TTract>& tr = it->second;
+	std::sort(tr.begin(), tr.end());
+	std::vector<TTract> merged;
+	for(size_t k = 0; k < tr.size(); ++k) {
+	  if ((!merged.empty()) && (tr[k].first < merged.back().second)) merged.back().second = std::max(merged.back().second, tr[k].second);
+	  else merged.push_back(tr[k]);
+	}
+	tr.swap(merged);
+      }
+      int32_t const trFlank = 200;
+      int32_t const maxTract = 10000;
+      for(int32_t i = 0; i < N; ++i) {
+	boost::unordered_map<int32_t, std::vector<TTract> >::const_iterator it = rootTracts.find(uf.find(i));
+	if (it == rootTracts.end()) continue;
+	if (als[i].trs >= 0) {
+	  for(size_t k = 0; k < it->second.size(); ++k) {
+	    if ((als[i].trs >= it->second[k].first) && (als[i].tre <= it->second[k].second)) {
+	      if (((als[i].trs != it->second[k].first) || (als[i].tre != it->second[k].second)) && (it->second[k].second - it->second[k].first <= maxTract)) {
+		newTrs[als[i].f][als[i].k] = it->second[k].first;
+		newTre[als[i].f][als[i].k] = it->second[k].second;
+	      }
+	      break;
+	    }
+	  }
+	  continue;
+	}
+	int32_t svE = (als[i].svt == 4) ? als[i].pos : als[i].end;
+	for(size_t k = 0; k < it->second.size(); ++k) {
+	  if (it->second[k].second - it->second[k].first > maxTract) continue;
+	  if ((als[i].pos >= it->second[k].first - trFlank) && (svE <= it->second[k].second + trFlank)) {
+	    newTrs[als[i].f][als[i].k] = it->second[k].first;
+	    newTre[als[i].f][als[i].k] = it->second[k].second;
+	    break;
+	  }
+	}
+      }
+    }
+    boost::unordered_map<int32_t, int32_t> rootId;
+    int32_t counter = 1;
+    for(int32_t i = 0; i < N; ++i) {
+      int32_t r = uf.find(i);
+      if (rootId.find(r) == rootId.end()) rootId[r] = counter++;
+      newAid[als[i].f][als[i].k] = rootId[r];
+      newNal[als[i].f][als[i].k] = rootCount[r];
+    }
+  }
+
+  inline void
+  mergeBCFs(MergeConfig& c, std::vector<boost::filesystem::path> const& cts) {
+    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+    std::cerr << '[' << boost::posix_time::to_simple_string(now) << "] " << "Merging SV types" << std::endl;
+
+    // Group INS:TR and DEL:TR at the same VNTR site
+    std::vector<std::vector<int32_t> > newAid;
+    std::vector<std::vector<int32_t> > newNal;
+    std::vector<std::vector<int32_t> > newTrs;
+    std::vector<std::vector<int32_t> > newTre;
+    _regroupLoci(c, cts, newAid, newNal, newTrs, newTre);
+    
+    // Parse temporary input VCF files
+    typedef std::vector<htsFile*> THtsFile;
+    typedef std::vector<bcf_hdr_t*> TBcfHeader;
+    typedef std::vector<bcf1_t*> TBcfRecord;
+    typedef std::vector<bool> TEof;
+    THtsFile ifile(cts.size());
+    TBcfHeader hdr(cts.size());
+    TBcfRecord rec(cts.size());
+    TEof eof(cts.size());
+    uint32_t allEOF = 0;
+    for(unsigned int file_c = 0; file_c < cts.size(); ++file_c) {
+      ifile[file_c] = bcf_open(cts[file_c].string().c_str(), "r");
+      hdr[file_c] = bcf_hdr_read(ifile[file_c]);
+      rec[file_c] = bcf_init();
+      if (bcf_read(ifile[file_c], hdr[file_c], rec[file_c]) == 0) {
+	bcf_unpack(rec[file_c], BCF_UN_INFO);
+	eof[file_c] = false;
+      } else {
+	++allEOF;
+	eof[file_c] = true;
+      }
+    }
+    
+    // Open output VCF file
+    std::string fmtout = "wb";
+    if (c.outfile.string() == "-") fmtout = "w";
+    htsFile *fp = hts_open(c.outfile.string().c_str(), fmtout.c_str());
+    bcf_hdr_t *hdr_out = bcf_hdr_dup(hdr[0]);
+    if (bcf_hdr_write(fp, hdr_out) != 0) std::cerr << "Error: Failed to write BCF header!" << std::endl;
+
+    // Merge files
+    int32_t ntrsOut = 0;
+    int32_t* trsOutp = NULL;
+    int32_t nsvtOut = 0;
+    char* svtOutp = NULL;
+    int32_t nsubOut = 0;
+    char* subOutp = NULL;
+    std::vector<int32_t> kcount(cts.size(), 0);   // per-file
+    while (allEOF < cts.size()) {
+      // Find next sorted record
+      int32_t idx = -1;
+      for(unsigned int file_c = 0; file_c < cts.size(); ++file_c) {
+	if (!eof[file_c]) {
+	  if ((idx < 0) || (rec[idx]->rid > rec[file_c]->rid) || ((rec[idx]->rid == rec[file_c]->rid) && (rec[idx]->pos > rec[file_c]->pos))) idx = file_c;
+	}
+      }
+
+      // Relabel locus (ALLELEID/NALLELE)
+      int32_t rk = kcount[idx]++;
+      if ((rk < (int32_t) newAid[idx].size()) && (newAid[idx][rk] > 0)) {
+	int32_t aidOut = newAid[idx][rk];
+	int32_t nalOut = newNal[idx][rk];
+	bcf_update_info_int32(hdr_out, rec[idx], "ALLELEID", &aidOut, 1);
+	bcf_update_info_int32(hdr_out, rec[idx], "NALLELE", &nalOut, 1);
+	if (newTrs[idx][rk] >= 0) {
+	  int32_t trsOut = newTrs[idx][rk] + 1;
+	  int32_t treOut = newTre[idx][rk];
+	  bcf_update_info_int32(hdr_out, rec[idx], "TRSTART", &trsOut, 1);
+	  bcf_update_info_int32(hdr_out, rec[idx], "TREND", &treOut, 1);
+	}
+	// TR locus
+	if ((c.annotated) && (c.longread) && (c.hasGenome) && (nalOut > 1) && ((newTrs[idx][rk] >= 0) || (bcf_get_info_int32(hdr_out, rec[idx], "TRSTART", &trsOutp, &ntrsOut) > 0))) {
+	  if (bcf_get_info_string(hdr_out, rec[idx], "SVTYPE", &svtOutp, &nsvtOut) > 0) {
+	    std::string svtOut(svtOutp);
+	    if ((svtOut == "DEL") || (svtOut == "INS")) {
+	      bool labelled = (bcf_get_info_string(hdr_out, rec[idx], "SUBTYPE", &subOutp, &nsubOut) > 0);
+	      if (!labelled) {
+		std::string subOut = svtOut + ":TR";
+		bcf_update_info_string(hdr_out, rec[idx], "SUBTYPE", subOut.c_str());
+	      }
+	    }
+	  }
+	}
+      }
+
+      // Write record
+      bcf_write1(fp, hdr_out, rec[idx]);
+
+      // Fetch next record
+      if (bcf_read(ifile[idx], hdr[idx], rec[idx]) == 0) bcf_unpack(rec[idx], BCF_UN_INFO);
+      else {
+	++allEOF;
+	eof[idx] = true;
+      }
+    }
+    
+  // Clean-up
+    if (trsOutp != NULL) free(trsOutp);
+    if (svtOutp != NULL) free(svtOutp);
+    if (subOutp != NULL) free(subOutp);
+    for(unsigned int file_c = 0; file_c < cts.size(); ++file_c) {
+      bcf_hdr_destroy(hdr[file_c]);
+      bcf_close(ifile[file_c]);
+      bcf_destroy(rec[file_c]);
+    }
+
+    // Close VCF file
+    bcf_hdr_destroy(hdr_out);
+    hts_close(fp);
+
+    // Build index
+    if (c.outfile.string() != "-") bcf_index_build(c.outfile.string().c_str(), 14);
+
+    // End
+    now = boost::posix_time::second_clock::local_time();
+    std::cerr << '[' << boost::posix_time::to_simple_string(now) << "] Done." << std::endl;
+  }
+  
+  inline int
+  mergeRun(MergeConfig& c, int32_t const svt) {
+
+    // All files may use a different set of chromosomes
+    typedef std::map<std::string, uint32_t> TContigMap;
+    TContigMap contigMap;
+    uint32_t numseq = 0;
+    for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+      htsFile* ifile = bcf_open(c.files[file_c].string().c_str(), "r");
+      bcf_hdr_t* hdr = bcf_hdr_read(ifile);
+      int nseq=0;
+      const char** seqnames = bcf_hdr_seqnames(hdr, &nseq);
+      for(int32_t i = 0; i<nseq;++i) {
+	std::string chrName(bcf_hdr_id2name(hdr, i));
+	if (contigMap.find(chrName) == contigMap.end()) contigMap[chrName] = numseq++;
+      }
+      if (seqnames!=NULL) free(seqnames);
+      bcf_hdr_destroy(hdr);
+      bcf_close(ifile);
+    }
+
+    if (svt == 9) {
+      // CNV merging (interval based)
+      typedef std::vector<IntervalScore> TIntervalScores;
+      typedef std::vector<TIntervalScores> TGenomeIntervals;
+      TGenomeIntervals iScore;
+      iScore.resize(numseq, TIntervalScores());
+      _fillCNVIntervalMap(c, iScore, contigMap);
+      for(uint32_t i = 0; i<numseq; ++i) std::sort(iScore[i].begin(), iScore[i].end());
+      TGenomeIntervals iSelected;
+      iSelected.resize(numseq, TIntervalScores());
+      _processCNVIntervalMap(c, iScore, iSelected);
+      iScore.clear();
+      for(uint32_t i = 0; i<numseq; ++i) std::sort(iSelected[i].begin(), iSelected[i].end());
+      _outputSelectedIntervalsCNVs(c, iSelected, contigMap);
+    } else {
+      // Subtype-aware, sequence-resolved, frequency-weighted SV merging
+      std::vector<MergeSV> nodes;
+      TKnownTracts knownTracts;
+      TKnownTracts* ktPtr = (((svt == 2) || (svt == 4)) ? &knownTracts : nullptr);
+      _collectSVtype(c, svt, contigMap, nodes, ktPtr);
+      boost::unordered_map<std::string, MergeAgg> selected;
+      _clusterAndSelect(c, nodes, selected, nullptr, &contigMap, ktPtr);
+      nodes.clear();
+      _emitSelected(c, svt, contigMap, selected);
+    }
+
+    // End
+    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+    std::cerr << '[' << boost::posix_time::to_simple_string(now) << "] Done." << std::endl;
+    
+    return 0;
+  }
+
+  int merge(int argc, char **argv) {
+    MergeConfig c;
+    c.svcounter = 1;
+    c.alleleCounter = 1; // for multi-allelic SVs (same id)
+
+    // Define generic options
+    boost::program_options::options_description generic("Generic options");
+    generic.add_options()
+      ("help,?", "show help message")
+      ("genome,g", boost::program_options::value<boost::filesystem::path>(&c.genome), "reference FASTA")
+      ("outfile,o", boost::program_options::value<boost::filesystem::path>(&c.outfile), "Merged SV BCF output file")
+      ("quality,y", boost::program_options::value<int32_t>(&c.qualthres)->default_value(200), "min. SV/CNV quality")
+      ("recurrent,q", boost::program_options::value<int32_t>(&c.recurrentSamples)->default_value(10), "carrier count to keep low-quality SVs/CNVs")
+      ("chunks,u", boost::program_options::value<uint32_t>(&c.chunksize)->default_value(500), "max. chunk size to merge groups of BCF files")
+      ("vaf,a", boost::program_options::value<float>(&c.vaf)->default_value(0.15), "min. fractional ALT support")
+      ("coverage,v", boost::program_options::value<uint32_t>(&c.coverage)->default_value(5), "min. coverage")
+      ("minsize,m", boost::program_options::value<uint32_t>(&c.minsize)->default_value(0), "min. SV size")
+      ("maxsize,n", boost::program_options::value<uint32_t>(&c.maxsize)->default_value(1000000), "max. SV size")
+      ("long-reads,l", boost::program_options::bool_switch(&c.longread), "long-read merge mode")
+      ("cnvmode,e", "Merge delly CNV files")
+      ("precise,c", "Filter sites for PRECISE")
+      ("pass,p", "Filter sites for PASS")
+      ;
+
+    // Define overlap options
+    boost::program_options::options_description svmerge("SV merge parameters");
+    svmerge.add_options()
+      ("bp-offset,b", boost::program_options::value<uint32_t>(&c.bpoffset)->default_value(1000), "default max. breakpoint offset")
+      ("rec-overlap,r", boost::program_options::value<float>(&c.recoverlap)->default_value(0.8), "default min. reciprocal overlap")
+      ("rep-min-af", boost::program_options::value<float>(&c.repMinAF)->default_value(0.005), "min. carrier fraction to keep a redundant rare allele (0 disables)")
+      ("mei-offset", boost::program_options::value<int32_t>(&c.meiOffset)->default_value(50), "max. breakpoint offset for MEIs")
+      ("mei-sizeratio", boost::program_options::value<float>(&c.meiSizeRatio)->default_value(0.85), "min. size ratio for MEIs")
+      ("mei-seqid", boost::program_options::value<float>(&c.meiSeqId)->default_value(0.8), "min. sequence identity for MEIs")
+      ("tr-offset", boost::program_options::value<int32_t>(&c.trOffset)->default_value(200), "min. breakpoint offset for tandem repeats")
+      ("tr-frac", boost::program_options::value<float>(&c.trFrac)->default_value(0.25), "breakpoint offset as fraction of TR size")
+      ("tr-seqid", boost::program_options::value<float>(&c.trSeqId)->default_value(0.7), "min. seq. identity for TRs")
+      ("tr-len-tol", boost::program_options::value<int32_t>(&c.trLenTol)->default_value(10), "min. length difference of distinct TR alleles")
+      ("tr-len-frac", boost::program_options::value<float>(&c.trLenFrac)->default_value(0.03, "0.03"), "min. fractional length difference of distinct TR alleles")
+      ("norm-frac", boost::program_options::value<float>(&c.normFrac)->default_value(0.5), "SV size normalized breakpoint offset fraction")
+      ("junc-seqid", boost::program_options::value<float>(&c.juncSeqId)->default_value(0.7), "min. consensus identity")
+      ("seq-cutoff", boost::program_options::value<int32_t>(&c.seqCutoff)->default_value(10000), "max. seq. length for identity checks")
+      ;
+
+    // CNV merge options
+    boost::program_options::options_description cnvmerge("CNV merge parameters (with -e)");
+    cnvmerge.add_options()
+      ("cnv-large-size", boost::program_options::value<int32_t>(&c.cnvLargeSize)->default_value(200000), "min. size for a loss to pass on read-depth alone")
+      ("cnv-min-uniq", boost::program_options::value<float>(&c.cnvMinUniq)->default_value(0.75), "min. UNIQ for a singleton loss")
+      ("cnv-gain-uniq", boost::program_options::value<float>(&c.cnvGainUniq)->default_value(0.9), "min. UNIQ for a recurrent gain")
+      ("cnv-min-windows", boost::program_options::value<int32_t>(&c.cnvMinWindows)->default_value(3), "min. CNV size as number of auto-windows")
+      ("cnv-min-carriers", boost::program_options::value<int32_t>(&c.cnvMinCarriers)->default_value(3), "min. recurrent samples")
+      ;
+
+    // Define hidden options
+    boost::program_options::options_description hidden("Hidden options");
+    hidden.add_options()
+      ("input-file", boost::program_options::value< std::vector<boost::filesystem::path> >(&c.files), "input file")
+      ;
+    boost::program_options::positional_options_description pos_args;
+    pos_args.add("input-file", -1);
+    
+    // Set the visibility
+    boost::program_options::options_description cmdline_options;
+    cmdline_options.add(generic).add(svmerge).add(cnvmerge).add(hidden);
+    boost::program_options::options_description visible_options;
+    visible_options.add(generic).add(svmerge).add(cnvmerge);
+    boost::program_options::variables_map vm;
+    boost::program_options::store(boost::program_options::command_line_parser(argc, argv).options(cmdline_options).positional(pos_args).run(), vm);
+    boost::program_options::notify(vm);
+
+
+    // Check command line arguments
+    if ((vm.count("help")) || (!vm.count("input-file"))) {
+      std::cerr << std::endl;
+      std::cerr << "Usage: delly " << argv[0] << " [OPTIONS] [<sample1.bcf> <sample2.bcf> ... | <list_of_bcf_files.txt>]" << std::endl;
+      std::cerr << visible_options << "\n";
+      return 0;
+    }
+
+    // Filter for PASS
+    if (vm.count("pass")) c.filterForPass = true;
+    else c.filterForPass = false;
+    
+    // Filter for PRECISE
+    if (vm.count("precise")) c.filterForPrecise = true;
+    else c.filterForPrecise = false;
+
+    // Merge CNVs
+    if (vm.count("cnvmode")) c.cnvMode = true;
+    else c.cnvMode = false;
+    
+    // Reference genome for consensus synthesis (optional)
+    if ((vm.count("genome")) && (!c.genome.empty())) {
+      if (!boost::filesystem::exists(c.genome)) {
+	std::cerr << "Reference genome does not exist: " << c.genome.string() << std::endl;
+	return 1;
+      }
+      c.hasGenome = true;
+    } else c.hasGenome = false;
+
+    // Long-reads
+    if (c.longread) {
+      if (!c.hasGenome) {
+	std::cerr << "Long-read mode requires the reference genome (-g)." << std::endl;
+	return 1;
+      }
+      if ((c.trLenTol < 0) || (c.trLenFrac < 0)) {
+	std::cerr << "Please specify a valid length tolerance for tandem repeats!" << std::endl;
+	return 1;
+      }
+    }
+
+    // Check output files
+    if (!vm.count("outfile")) c.outfile = "-";
+    else {
+      if (c.outfile.string() != "-") {
+	if (!_outfileValid(c.outfile)) return 1;
+	if (!_outfileValid(boost::filesystem::path(c.outfile.string() + ".csi"))) return 1;
+      }
+    }
+    
+    // Show cmd
+    boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+    std::cerr << '[' << boost::posix_time::to_simple_string(now) << "] ";
+    std::cerr << "delly ";
+    for(int i=0; i<argc; ++i) { std::cerr << argv[i] << ' '; }
+    std::cerr << std::endl;
+    
+    // Check chunksize
+    if (c.chunksize < 100) c.chunksize = 100;
+    
+    // Check input BCF files
+    if (c.files.size() == 1) {
+      // Single file: VCF/BCF or list of files?
+      if (!(boost::filesystem::exists(c.files[0]) && boost::filesystem::is_regular_file(c.files[0]) && boost::filesystem::file_size(c.files[0]))) {
+	std::cerr << "Input file list " << c.files[0].string() << " is missing!" << std::endl;
+	return 1;
+      }
+      htsFile* inf = bcf_open(c.files[0].string().c_str(), "r");
+      if (inf != NULL) {
+	bcf_hdr_t* header = NULL;
+	header = bcf_hdr_read(inf);
+	if (header == NULL) {
+	  std::cerr << "Assuming input is a list of BCF files" << std::endl;
+	  std::string fname = c.files[0].string();
+	  c.files.clear();
+	  std::ifstream lf(fname.c_str());
+	  if (lf.good()) {
+	    std::string line;
+	    while(std::getline(lf, line)) {
+	      if (!line.empty()) {
+		if (line.at(line.length() - 1) == '\r' ) {
+		  line = line.substr(0, line.length() - 1);
+		}
+		c.files.push_back(line);
+	      }
+	    }
+	    lf.close();
+	  }
+	} else {
+	  bcf_hdr_destroy(header);
+	}
+      }
+      bcf_close(inf);
+    }
+    c.annotated = true;
+    for(unsigned int file_c = 0; file_c < c.files.size(); ++file_c) {
+      htsFile* ifile = bcf_open(c.files[file_c].string().c_str(), "r");
+      if (!ifile) {
+	std::cerr << "Fail to load " << c.files[file_c].string() << "!" << std::endl;
+	return 1;
+      }
+      bcf_hdr_t* ihdr = bcf_hdr_read(ifile);
+      if (ihdr == NULL) {
+	std::cerr << "Fail to read header of " << c.files[file_c].string() << "!" << std::endl;
+	bcf_close(ifile);
+	return 1;
+      }
+      int32_t subId = bcf_hdr_id2int(ihdr, BCF_DT_ID, "SUBTYPE");
+      if ((subId < 0) || (!bcf_hdr_idinfo_exists(ihdr, BCF_HL_INFO, subId))) c.annotated = false;
+      bcf_hdr_destroy(ihdr);
+      bcf_close(ifile);
+    }
+
+    // Total number of samples
+    c.totalSamples = c.files.size();
+    c.chunkMerge = false;
+    
+    // Determine optimal chunksize
+    if (c.files.size() > c.chunksize) {
+      int32_t bestChunkSize = c.chunksize;
+      int32_t bestBinSize = 0;
+      for(uint32_t i = 50; i < c.chunksize; ++i) {
+	int32_t chunks = ((c.files.size() - 1) / i);
+	int32_t lastBin = c.files.size() - chunks * i;
+	if (lastBin > bestBinSize) {
+	  bestBinSize = lastBin;
+	  bestChunkSize = i;
+	}
+      }
+      c.chunksize = bestChunkSize;
+    }
+    
+    // Run merging
+    int32_t minSVT = 0;
+    int32_t maxSVT = 9;
+    if (c.cnvMode) {
+      minSVT = 9;
+      maxSVT = 10;
+    }
+    boost::filesystem::path oldPath = c.outfile;
+    std::vector<boost::filesystem::path> svtCollect(maxSVT);
+    for(int32_t svt = minSVT; svt < maxSVT; ++svt) {
+      boost::uuids::uuid uuid = boost::uuids::random_generator()();
+      std::string filename = "svt" + boost::lexical_cast<std::string>(svt) + "_" + boost::lexical_cast<std::string>(uuid) + ".bcf";
+      svtCollect[svt] = filename;
+      if (c.files.size() <= c.chunksize) {
+	// Merge in one go
+	c.outfile = svtCollect[svt];
+	mergeRun(c, svt);
+      } else {
+	// Merge in chunks
+	std::vector<boost::filesystem::path> fileRestore = c.files;
+	uint32_t chunks = ((c.files.size() - 1) / c.chunksize) + 1;
+	std::vector<boost::filesystem::path> chunkCollect(chunks);
+	for(uint32_t ic = 0; ic < chunks; ++ic) {
+	  boost::uuids::uuid uuid2 = boost::uuids::random_generator()();
+	  std::string chunkfile = "chunk" + boost::lexical_cast<std::string>(ic) + "_" + boost::lexical_cast<std::string>(uuid2) + ".bcf";
+	  chunkCollect[ic] = chunkfile;
+	  c.files.clear();
+	  for(uint32_t k = ic * c.chunksize; ((k < ((ic+1) * c.chunksize)) && (k < fileRestore.size())); ++k) c.files.push_back(fileRestore[k]);
+	  c.outfile = chunkCollect[ic];
+	  c.totalSamples = c.files.size();
+	  mergeRun(c, svt);
+	}
+	// Merge chunks
+	c.files = chunkCollect;
+	c.totalSamples = fileRestore.size();
+	c.chunkMerge = true;
+	c.outfile = svtCollect[svt];
+	// Reset VAF and coverage because these are site lists (AC/AN/SUPP are carried in INFO)
+	float vafStore = c.vaf;
+	uint32_t coverageStore = c.coverage;
+	c.vaf = 0;
+	c.coverage = 0;
+	mergeRun(c, svt);
+	c.chunkMerge = false;
+	c.vaf = vafStore;
+	c.coverage = coverageStore;
+	// Clean-up
+	for(uint32_t ic = 0; ic < chunks; ++ic) {
+	  boost::filesystem::remove(chunkCollect[ic]);
+	  boost::filesystem::remove(boost::filesystem::path(chunkCollect[ic].string() + ".csi"));
+	}
+	c.files = fileRestore;
+      }
+    }
+    
+    // Merge temporary files
+    c.outfile = oldPath;
+    if (c.cnvMode) {
+      // Copy
+      boost::filesystem::copy_file(svtCollect[9], c.outfile);
+      boost::filesystem::copy_file(boost::filesystem::path(svtCollect[9].string() + ".csi"), boost::filesystem::path(c.outfile.string() + ".csi"));
+      // Delete
+      boost::filesystem::remove(svtCollect[9]);
+      boost::filesystem::remove(boost::filesystem::path(svtCollect[9].string() + ".csi"));
+    } else {
+      mergeBCFs(c, svtCollect);
+      for(int32_t svt = minSVT; svt < maxSVT; ++svt) {
+	boost::filesystem::remove(svtCollect[svt]);
+	boost::filesystem::remove(boost::filesystem::path(svtCollect[svt].string() + ".csi"));
+      }
+    }
+    return 0;
+  }
+
+}
+
+#endif

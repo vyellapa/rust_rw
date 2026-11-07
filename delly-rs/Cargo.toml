@@ -1,0 +1,23 @@
+[package]
+name = "delly-rs"
+version = "2.8.1"
+edition = "2021"
+description = "Rust port of Delly (sr subcommand) with byte-identical output"
+license = "BSD-3-Clause"
+
+[[bin]]
+name = "delly"
+path = "src/main.rs"
+
+[dependencies]
+rayon = "1.10"
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.1"
+
+[profile.release]
+opt-level = 3
+debug = 1
+codegen-units = 1
+lto = "thin"

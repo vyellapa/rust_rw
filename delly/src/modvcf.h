@@ -1,0 +1,953 @@
+#ifndef MODVCF_H
+#define MODVCF_H
+
+#include <htslib/sam.h>
+#include <htslib/vcf.h>
+
+#include "bolog.h"
+#include "ploidy.h"
+#include "methyl.h"
+
+
+namespace torali
+{
+
+
+  void _remove_info_tag(bcf_hdr_t const* hdr, bcf1_t* rec, std::string const& tag) {
+    bcf_update_info(hdr, rec, tag.c_str(), NULL, 0, BCF_HT_INT);  // Type does not matter for n = 0
+  }
+  
+  void _remove_format_tag(bcf_hdr_t const* hdr, bcf1_t* rec, std::string const& tag) {
+    bcf_update_format(hdr, rec, tag.c_str(), NULL, 0, BCF_HT_INT);  // Type does not matter for n = 0
+  }
+  
+  void _remove_info(bcf_hdr_t* hdr, bcf1_t* rec) {
+    std::string tmp[] = {"CT", "PRECISE", "IMPRECISE", "SVTYPE", "SVMETHOD", "CIEND", "CIPOS", "CHR2", "POS2", "END", "PE", "MAPQ", "SRMAPQ", "SR", "SRQ", "CONSENSUS"};
+    std::set<std::string> keepInfo(tmp, tmp + sizeof(tmp)/sizeof(tmp[0]));
+    
+    if (!(rec->unpacked & BCF_UN_INFO)) bcf_unpack(rec, BCF_UN_INFO);
+  
+    for (uint32_t i = 0; i < rec->n_info; ++i){
+      bcf_info_t* inf = &rec->d.info[i];
+      const char* key = bcf_hdr_int2id(hdr, BCF_DT_ID, inf->key);
+      if (keepInfo.find(std::string(key)) != keepInfo.end()) continue;
+      
+      if (inf->vptr_free) {
+	free(inf->vptr - inf->vptr_off);
+	inf->vptr_free = 0;
+      }
+      rec->d.shared_dirty |= BCF1_DIRTY_INF;
+      inf->vptr = NULL;
+    }
+  }
+  
+  void _remove_format(bcf_hdr_t* hdr, bcf1_t* rec) {
+    if (!(rec->unpacked & BCF_UN_FMT)) bcf_unpack(rec, BCF_UN_FMT);
+    
+    for(uint32_t i = 0; i<rec->n_fmt; ++i) {
+      bcf_fmt_t* fmt = &rec->d.fmt[i];
+      const char* key = bcf_hdr_int2id(hdr, BCF_DT_ID, fmt->id);
+      bcf_update_format(hdr, rec, key, NULL, 0, BCF_HT_INT); // the type is irrelevant for n = 0
+      // Keep GT
+      //if ((key[0]=='G') && key[1]=='T' && (!key[2])) continue;
+      
+      if (fmt->p_free) {
+	free(fmt->p - fmt->p_off);
+	fmt->p_free = 0;
+      }
+      rec->d.indiv_dirty = 1;
+      fmt->p = NULL;
+    }
+  }
+  
+  inline int
+  _getInfoType(bcf_hdr_t const* hdr, std::string const& key) {
+    return bcf_hdr_id2type(hdr, BCF_HL_INFO, bcf_hdr_id2int(hdr, BCF_DT_ID, key.c_str()));
+  }
+  
+  inline int
+  _getFormatType(bcf_hdr_t const* hdr, std::string const& key) {
+    return bcf_hdr_id2type(hdr, BCF_HL_FMT, bcf_hdr_id2int(hdr, BCF_DT_ID, key.c_str()));
+  }
+  
+  inline bool _missing(bool const value) {
+    return !value;
+  }
+  
+  inline bool _missing(float const value) {
+    return bcf_float_is_missing(value);
+  }
+  
+  inline bool _missing(int8_t const value) {
+    return (value == bcf_int8_missing);
+  }
+  
+  inline bool _missing(int16_t const value) {
+    return (value == bcf_int16_missing);
+  }
+
+  inline bool _missing(int32_t const value) {
+    return (value == bcf_int32_missing);
+  }
+
+  inline bool _missing(std::string const& value) {
+    return ((value.empty()) || (value == "."));
+  }
+  
+  inline bool
+  _isKeyPresent(bcf_hdr_t const* hdr, std::string const& key) {
+    return (bcf_hdr_id2int(hdr, BCF_DT_ID, key.c_str())>=0);
+  }
+
+  inline std::string
+  _replaceIUPAC(std::string const& alleles) {
+    std::vector<char> out(alleles.size());
+    int32_t inTag = 0;
+    bool inRef = true;  // REF allele
+    for(uint32_t i = 0; i<alleles.size(); ++i) {
+      if (alleles[i] == ',') { inRef = false; }
+      if ((inRef) || (inTag) || (alleles[i] == 'A') || (alleles[i] == 'C') || (alleles[i] == 'G') || (alleles[i] == 'T') || (alleles[i] == 'N') || (alleles[i] == 'a') || (alleles[i] == 'c') || (alleles[i] == 'g') || (alleles[i] == 't') || (alleles[i] == 'n') || (alleles[i] == '<') || (alleles[i] == '>') || (alleles[i] == ']') || (alleles[i] == '[') || (alleles[i] == ',')) {
+	out[i] = alleles[i];
+	if (alleles[i] == '<') inTag = 1;
+	else if (alleles[i] == ']') inTag = 2;
+	else if (alleles[i] == '[') inTag = 3;
+	else if ((alleles[i] == '>') && (inTag == 1)) inTag = 0;
+	else if ((alleles[i] == ']') && (inTag == 2)) inTag = 0;
+	else if ((alleles[i] == '[') && (inTag == 3)) inTag = 0;
+      } else {
+	// Replace IUPAC in ALT only
+	if ((alleles[i] == 'U') || (alleles[i] == 'u')) out[i] = 'T';
+	else if ((alleles[i] == 'R') || (alleles[i] == 'r')) out[i] = 'A';
+	else if ((alleles[i] == 'Y') || (alleles[i] == 'y')) out[i] = 'C';
+	else if ((alleles[i] == 'S') || (alleles[i] == 's')) out[i] = 'C';
+	else if ((alleles[i] == 'W') || (alleles[i] == 'w')) out[i] = 'A';
+	else if ((alleles[i] == 'K') || (alleles[i] == 'k')) out[i] = 'G';
+	else if ((alleles[i] == 'M') || (alleles[i] == 'm')) out[i] = 'A';
+	else if ((alleles[i] == 'B') || (alleles[i] == 'b')) out[i] = 'C';
+	else if ((alleles[i] == 'D') || (alleles[i] == 'd')) out[i] = 'A';
+	else if ((alleles[i] == 'H') || (alleles[i] == 'h')) out[i] = 'A';
+	else if ((alleles[i] == 'V') || (alleles[i] == 'v')) out[i] = 'A';
+	else out[i] = 'N';
+      }
+    }
+    return std::string(out.begin(), out.end());
+  }     
+  
+ 
+  // Convert string to char*
+  struct cstyle_str {
+    const char* operator ()(const std::string& s) {
+      return s.c_str();
+    }
+  };
+
+  // Type-trait helper: returns c.minCpgDepth if the config has it, else 0
+  template<typename T, typename = void>
+  struct _HasMinCpgDepth : std::false_type {};
+  template<typename T>
+  struct _HasMinCpgDepth<T, std::void_t<decltype(std::declval<T>().minCpgDepth)>> : std::true_type {};
+  
+  template<typename T>
+  inline uint32_t _getMinCpgDepth(const T& c) {
+    if constexpr (_HasMinCpgDepth<T>::value) return c.minCpgDepth;
+    else return 0;
+  }
+
+  // GLs for TR loci
+  template<typename TJunctionCount>
+  inline void
+  _locusGLs(TJunctionCount const& jc, float* gls, int32_t* gqval, int32_t* gts, int const file_c, uint8_t const ploidy) {
+    gls[file_c * 3] = jc.gl[0];
+    gls[file_c * 3 + 1] = jc.gl[1];
+    gls[file_c * 3 + 2] = jc.gl[2];
+    gqval[file_c] = jc.locusGq;
+    if (ploidy == 0) {
+      gts[file_c * 2] = bcf_gt_missing;
+      gts[file_c * 2 + 1] = bcf_gt_missing;
+      gqval[file_c] = 0;
+    } else if (ploidy == 1) {
+      gts[file_c * 2] = (jc.locusGt > 0) ? bcf_gt_unphased(1) : bcf_gt_unphased(0);
+      gts[file_c * 2 + 1] = bcf_int32_vector_end;
+    } else {
+      gts[file_c * 2] = (jc.locusGt == 2) ? bcf_gt_unphased(1) : bcf_gt_unphased(0);
+      gts[file_c * 2 + 1] = (jc.locusGt >= 1) ? bcf_gt_unphased(1) : bcf_gt_unphased(0);
+    }
+  }
+  
+// Parse Delly vcf file
+template<typename TConfig, typename TStructuralVariantRecord>
+inline void
+vcfParse(TConfig const& c, bam_hdr_t* hd, std::vector<TStructuralVariantRecord>& svs) {
+  // Load bcf file
+  htsFile* ifile = bcf_open(c.vcffile.string().c_str(), "r");
+  bcf_hdr_t* hdr = bcf_hdr_read(ifile);
+  bcf1_t* rec = bcf_init();
+
+  // Parse bcf
+  int32_t nsvend = 0;
+  int32_t* svend = NULL;
+  int32_t npos2 = 0;
+  int32_t* pos2 = NULL;
+  int32_t nconsbp = 0;
+  int32_t* consbp = NULL;
+  int32_t nsvlen = 0;
+  int32_t* svlen = NULL;
+  int32_t npe = 0;
+  int32_t* pe = NULL;
+  int32_t ninslen = 0;
+  int32_t* inslen = NULL;
+  int32_t nhomlen = 0;
+  int32_t* homlen = NULL;
+  int32_t ntrperiod = 0;
+  int32_t* trperiod = NULL;
+  int32_t ntrcopies = 0;
+  float* trcopies = NULL;
+  int32_t nsubtype = 0;
+  char* subtype = NULL;
+  int32_t ninsstrand = 0;
+  char* insstrand = NULL;
+  int32_t const subtypeId = bcf_hdr_id2int(hdr, BCF_DT_ID, "SUBTYPE");
+  bool const sitesAnnotated = ((subtypeId >= 0) && (bcf_hdr_idinfo_exists(hdr, BCF_HL_INFO, subtypeId)));
+  int32_t nsr = 0;
+  int32_t* sr = NULL;
+  int32_t ncipos = 0;
+  int32_t* cipos = NULL;
+  int32_t nmapq = 0;
+  int32_t* mapq = NULL;
+  int32_t nct = 0;
+  char* ct = NULL;
+  int32_t nsrq = 0;
+  float* srq = NULL;
+  int32_t nsvt = 0;
+  char* svt = NULL;
+  int32_t nmethod = 0;
+  char* method = NULL;
+  int32_t ncons = 0;
+  char* cons = NULL;
+  int32_t nchr2 = 0;
+  char* chr2 = NULL;
+  int32_t nalleleid = 0;
+  int32_t* alleleidp = NULL;
+  int32_t nnallele = 0;
+  int32_t* nallelep = NULL;
+  int32_t ntrstart = 0;
+  int32_t* trstartp = NULL;
+  int32_t ntrend = 0;
+  int32_t* trendp = NULL;
+  bool dellyVCF = false;
+  while (bcf_read(ifile, hdr, rec) == 0) {
+    bcf_unpack(rec, BCF_UN_INFO);
+
+    // Delly BCF file?
+    if (!dellyVCF) {
+      if (bcf_get_info_string(hdr, rec, "SVMETHOD", &method, &nmethod) > 0) {
+	std::string mstr = std::string(method);
+	if ((mstr.size() >= 10) && (mstr.substr(0, 10)  == "EMBL.DELLY")) {
+	  if (_isKeyPresent(hdr, "CONSBP")) dellyVCF = true;
+	}
+      }
+    }
+
+    // Delly
+    if (dellyVCF) {
+      // Fill SV record
+      StructuralVariantRecord svRec;
+      std::string chrName = bcf_hdr_id2name(hdr, rec->rid);
+      int32_t tid = bam_name2id(hd, chrName.c_str());
+      svRec.chr = tid;
+      svRec.svStart = rec->pos + 1;
+      svRec.id = svs.size();
+      svRec.mapq = rec->qual;
+      std::string refAllele = rec->d.allele[0];
+      if ((!refAllele.empty()) && (refAllele != ".")) {
+	std::string altAllele = rec->d.allele[1];
+	if ((!altAllele.empty()) && (altAllele != ".")) {
+	  svRec.alleles = refAllele + "," + altAllele;
+	}
+      }
+
+      // Parse SV type
+      if ((bcf_get_info_string(hdr, rec, "SVTYPE", &svt, &nsvt) > 0) && (bcf_get_info_string(hdr, rec, "CT", &ct, &nct) > 0)) svRec.svt = _decodeOrientation(std::string(ct), std::string(svt));
+      else continue;
+      
+      // Parse INFO
+      if (bcf_get_info_flag(hdr, rec, "PRECISE", 0, 0) > 0) svRec.precise=true;
+      else svRec.precise = false;
+      if (bcf_get_info_int32(hdr, rec, "PE", &pe, &npe) > 0) svRec.peSupport = *pe;
+      else {
+	if (svRec.precise) svRec.peSupport = 0;
+	else svRec.peSupport = 2;
+      }
+      if (svRec.svt != 4) {
+	if (bcf_get_info_int32(hdr, rec, "INSLEN", &inslen, &ninslen) > 0) svRec.insLen = *inslen;
+	else svRec.insLen = 0;
+      } else {
+	// Insertions must have INFO/SVLEN
+	if (bcf_get_info_int32(hdr, rec, "SVLEN", &svlen, &nsvlen) > 0) svRec.insLen = *svlen;
+	else continue;
+      }
+      if (bcf_get_info_int32(hdr, rec, "HOMLEN", &homlen, &nhomlen) > 0) svRec.homLen = *homlen;
+      else svRec.homLen = 0;
+      // SV annotation
+      if (sitesAnnotated) {
+	svRec.anno.fromSites = true;
+	svRec.anno.homLen = svRec.homLen;
+	if (bcf_get_info_string(hdr, rec, "SUBTYPE", &subtype, &nsubtype) > 0) {
+	  std::string sub(subtype);
+	  if (sub == "INS:ME:ALU") svRec.anno.seqType = 1;
+	  else if (sub == "INS:ME:LINE1") svRec.anno.seqType = 2;
+	  else if (sub == "INS:ME:SVA") svRec.anno.seqType = 3;
+	  else if (sub == "INS:NUMT") svRec.anno.seqType = 4;
+	  else if (sub == "INS:LTR") svRec.anno.seqType = 5;
+	  else if (sub == "INS:HERVK") svRec.anno.seqType = 6;
+	  else if ((sub == "INS:TR") || (sub == "DEL:TR")) {
+	    // Tandem repeats
+	    if (bcf_get_info_int32(hdr, rec, "TRPERIOD", &trperiod, &ntrperiod) > 0) {
+	      svRec.anno.seqType = 7;
+	      svRec.anno.trPeriod = *trperiod;
+	      if (bcf_get_info_float(hdr, rec, "TRCOPIES", &trcopies, &ntrcopies) > 0) svRec.anno.trCopies = *trcopies;
+	    }
+	  }
+	  if ((svRec.anno.seqType >= 1) && (svRec.anno.seqType <= 6) && (bcf_get_info_string(hdr, rec, "INSSTRAND", &insstrand, &ninsstrand) > 0)) svRec.anno.isRC = (insstrand[0] == '-');
+	}
+      }
+      if (bcf_get_info_int32(hdr, rec, "SR", &sr, &nsr) > 0) svRec.srSupport = *sr;
+      else svRec.srSupport = 0;
+
+      // SV end assignment
+      svRec.chr2 = tid;
+      svRec.svEnd = rec->pos + 1;
+      if (svRec.svt < DELLY_SVT_TRANS) {
+	if (bcf_get_info_int32(hdr, rec, "END", &svend, &nsvend) > 0) svRec.svEnd = *svend;
+	if (!svRec.alleles.empty()) {
+	  size_t commaPos = svRec.alleles.find(',');
+	  bool isSymbolic = (commaPos == std::string::npos);
+	  if (!isSymbolic) {
+	    std::string alt = svRec.alleles.substr(commaPos + 1);
+	    isSymbolic = (!alt.empty()) && ((alt[0] == '<') || (alt.find('[') != std::string::npos) || (alt.find(']') != std::string::npos));
+	  }
+	  if (!isSymbolic) svRec.svEnd = svRec.svStart + (int32_t) commaPos;
+	}
+      } else {
+	// Inter-chromosomal SV
+	if (bcf_get_info_string(hdr, rec, "CHR2", &chr2, &nchr2) > 0) {
+	  std::string chr2Name = std::string(chr2);
+	  svRec.chr2 = bam_name2id(hd, chr2Name.c_str());
+	}
+	if (bcf_get_info_int32(hdr, rec, "POS2", &pos2, &npos2) > 0) svRec.svEnd = *pos2;
+      }
+      if (bcf_get_info_string(hdr, rec, "CONSENSUS", &cons, &ncons) > 0) {
+	svRec.consensus = std::string(cons);
+	if (bcf_get_info_int32(hdr, rec, "CONSBP", &consbp, &nconsbp) > 0) svRec.consBp = *consbp;
+      }
+      else svRec.precise = false;
+      if (bcf_get_info_int32(hdr, rec, "CIPOS", &cipos, &ncipos) > 0) {
+	svRec.ciposlow = cipos[0];
+	svRec.ciposhigh = cipos[1];
+      } else {
+	svRec.ciposlow = -50;
+	svRec.ciposhigh = 50;
+      }
+      if (bcf_get_info_int32(hdr, rec, "CIEND", &cipos, &ncipos) > 0) {
+	svRec.ciendlow = cipos[0];
+	svRec.ciendhigh = cipos[1];
+      } else {
+	svRec.ciendlow = -50;
+	svRec.ciendhigh = 50;
+      }
+      if (bcf_get_info_int32(hdr, rec, "MAPQ", &mapq, &nmapq) > 0) svRec.peMapQuality = (uint8_t) *mapq;
+      else svRec.peMapQuality = 0;
+      if (bcf_get_info_int32(hdr, rec, "SRMAPQ", &mapq, &nmapq) > 0) svRec.srMapQuality = (uint8_t) *mapq;
+      else svRec.srMapQuality = 0;
+      if (bcf_get_info_float(hdr, rec, "SRQ", &srq, &nsrq) > 0) svRec.srAlignQuality = (double) *srq;
+      else svRec.srAlignQuality = 0;
+      if (bcf_get_info_int32(hdr, rec, "ALLELEID", &alleleidp, &nalleleid) > 0) {
+	svRec.alleleid = *alleleidp;
+	if (bcf_get_info_int32(hdr, rec, "NALLELE", &nallelep, &nnallele) > 0) svRec.nallele = *nallelep;
+	if ((bcf_get_info_int32(hdr, rec, "TRSTART", &trstartp, &ntrstart) > 0) && (bcf_get_info_int32(hdr, rec, "TREND", &trendp, &ntrend) > 0)) {
+	  svRec.trStart = *trstartp - 1;
+	  svRec.trEnd = *trendp;
+	}
+      }
+      svs.push_back(svRec);
+    } else {
+      std::cerr << "Error: Delly genotyping requires local SV assembly (INFO/CONSENSUS) and breakpoint (INFO/CONSBP) introduced in delly v1.1.7!" << std::endl;
+      break;
+    }
+  }
+  // Clean-up
+  free(svend);
+  free(pos2);
+  free(consbp);
+  free(svlen);
+  free(svt);
+  free(method);
+  free(alleleidp);
+  free(nallelep);
+  free(trstartp);
+  free(trendp);
+  free(pe);
+  free(inslen);
+  free(homlen);
+  if (trperiod != NULL) free(trperiod);
+  if (trcopies != NULL) free(trcopies);
+  if (subtype != NULL) free(subtype);
+  if (insstrand != NULL) free(insstrand);
+  free(sr);
+  free(cons);
+  free(cipos);
+  free(mapq);
+  free(srq);
+  free(ct);
+  free(chr2);
+
+  // Close VCF
+  bcf_hdr_destroy(hdr);
+  bcf_close(ifile);
+  bcf_destroy(rec);
+}
+
+
+template<typename TConfig, typename TStructuralVariantRecord, typename TJunctionCountMap, typename TReadCountMap, typename TCountMap, typename TMethylMap>
+inline void
+vcfOutput(TConfig const& c, std::vector<TStructuralVariantRecord> const& svs, TJunctionCountMap const& jctCountMap, TReadCountMap const& readCountMap, TCountMap const& spanCountMap, TMethylMap const& methylMap)
+{
+  // BoLog class
+  BoLog<double> bl;
+
+  // Open one bam file header
+  samFile* samfile = sam_open(c.files[0].string().c_str(), "r");
+  hts_set_fai_filename(samfile, c.genome.string().c_str());
+  bam_hdr_t* bamhd = sam_hdr_read(samfile);
+
+  // Output all structural variants
+  std::string fmtout = "wb";
+  if (c.outfile.string() == "-") fmtout = "w";
+  htsFile *fp = hts_open(c.outfile.string().c_str(), fmtout.c_str());
+  bcf_hdr_t *hdr = bcf_hdr_init("w");
+
+  // Print vcf header
+  boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+  boost::gregorian::date today = now.date();
+  std::string datestr("##fileDate=");
+  datestr += boost::gregorian::to_iso_string(today);
+  bcf_hdr_append(hdr, datestr.c_str());
+  bcf_hdr_append(hdr, "##ALT=<ID=DEL,Description=\"Deletion\">");
+  bcf_hdr_append(hdr, "##ALT=<ID=DUP,Description=\"Duplication\">");
+  bcf_hdr_append(hdr, "##ALT=<ID=INV,Description=\"Inversion\">");
+  bcf_hdr_append(hdr, "##ALT=<ID=BND,Description=\"Translocation\">");
+  bcf_hdr_append(hdr, "##ALT=<ID=INS,Description=\"Insertion\">");
+  bcf_hdr_append(hdr, "##FILTER=<ID=LowQual,Description=\"Poor quality and insufficient number of PEs and SRs.\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=CIEND,Number=2,Type=Integer,Description=\"PE confidence interval around END\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=CIPOS,Number=2,Type=Integer,Description=\"PE confidence interval around POS\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=CHR2,Number=1,Type=String,Description=\"Chromosome for POS2 coordinate in case of an inter-chromosomal translocation\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=POS2,Number=1,Type=Integer,Description=\"Genomic position for CHR2 in case of an inter-chromosomal translocation\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the structural variant\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=PE,Number=1,Type=Integer,Description=\"Paired-end support of the structural variant\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=MAPQ,Number=1,Type=Integer,Description=\"Median mapping quality of paired-ends\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=SRMAPQ,Number=1,Type=Integer,Description=\"Median mapping quality of split-reads\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=SR,Number=1,Type=Integer,Description=\"Split-read support\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=SRQ,Number=1,Type=Float,Description=\"Split-read consensus alignment quality\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=CONSENSUS,Number=1,Type=String,Description=\"Split-read consensus sequence\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=CONSBP,Number=1,Type=Integer,Description=\"Consensus SV breakpoint position\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=CE,Number=1,Type=Float,Description=\"Consensus sequence entropy\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=CT,Number=1,Type=String,Description=\"Paired-end signature induced connection type\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"SV length; negative for DEL, positive for DUP/INV/INS.\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"Imprecise structural variation\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=PRECISE,Number=0,Type=Flag,Description=\"Precise structural variation\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=SVMETHOD,Number=1,Type=String,Description=\"Type of approach used to detect SV\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=INSLEN,Number=1,Type=Integer,Description=\"Predicted length of the insertion\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=HOMLEN,Number=1,Type=Integer,Description=\"Breakpoint homology length\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=SUBTYPE,Number=1,Type=String,Description=\"SV subtype: INS:ME:ALU, INS:ME:LINE1, INS:ME:SVA, INS:NUMT, INS:LTR, INS:HERVK, INS:TR, or DEL:TR\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=ALLELEID,Number=1,Type=Integer,Description=\"Identifier of the merged locus\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=NALLELE,Number=1,Type=Integer,Description=\"Number of distinct alleles at this locus\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=INSSTRAND,Number=1,Type=String,Description=\"Insertion strand for MEIs\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=TRPERIOD,Number=1,Type=Integer,Description=\"Tandem repeat period in bp\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=TRSTART,Number=1,Type=Integer,Description=\"Start of the reference tandem repeat\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=TREND,Number=1,Type=Integer,Description=\"End of the reference tandem repeat\">");
+  bcf_hdr_append(hdr, "##INFO=<ID=TRCOPIES,Number=1,Type=Float,Description=\"Tandem repeat copy number\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">");
+  //bcf_hdr_append(hdr, "##FORMAT=<ID=GL,Number=G,Type=Float,Description=\"Log10-scaled genotype likelihoods\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=PL,Number=G,Type=Integer,Description=\"Phred-scaled genotype likelihoods\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"Genotype Quality\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=FT,Number=1,Type=String,Description=\"Per-sample genotype filter\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=RC,Number=1,Type=Integer,Description=\"Raw high-quality read counts or base counts for the SV\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=RCL,Number=1,Type=Integer,Description=\"Raw high-quality read counts or base counts for the left control region\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=RCR,Number=1,Type=Integer,Description=\"Raw high-quality read counts or base counts for the right control region\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=RDCN,Number=1,Type=Integer,Description=\"Read-depth based copy-number estimate for autosomal sites\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=DR,Number=1,Type=Integer,Description=\"# high-quality reference pairs\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=DV,Number=1,Type=Integer,Description=\"# high-quality variant pairs\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=RR,Number=1,Type=Integer,Description=\"# high-quality reference junction reads\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=RV,Number=1,Type=Integer,Description=\"# high-quality variant junction reads\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=HP,Number=4,Type=Integer,Description=\"Haplotype-specific junction read counts (HP1_ref,HP1_alt,HP2_ref,HP2_alt)\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=PS,Number=1,Type=Integer,Description=\"Phase set identifier from HP-tagged alignments\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=MR,Number=4,Type=Integer,Description=\"Methylation % for REF allele [SV start left/right, SV end left/right]\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=MA,Number=4,Type=Integer,Description=\"Methylation % for ALT allele [SV start left/right, SV end left/right]\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=MNC,Number=4,Type=Integer,Description=\"Unique CpG sites observed per window [SV start left/right, SV end left/right]\">");
+  bcf_hdr_append(hdr, "##FORMAT=<ID=MDV,Number=4,Type=Integer,Description=\"Avg. read depth per CpG site per window [SV start left/right, SV end left/right]\">"); 
+
+  // Add reference
+  std::string refloc("##reference=");
+  refloc += c.genome.string();
+  bcf_hdr_append(hdr, refloc.c_str());
+  for (int i = 0; i<bamhd->n_targets; ++i) {
+    std::string refname("##contig=<ID=");
+    refname += std::string(bamhd->target_name[i]) + ",length=" + boost::lexical_cast<std::string>(bamhd->target_len[i]) + ">";
+    bcf_hdr_append(hdr, refname.c_str());
+  }
+  // Add samples
+  for(unsigned int file_c = 0; file_c < jctCountMap.size(); ++file_c) bcf_hdr_add_sample(hdr, c.sampleName[file_c].c_str());
+  bcf_hdr_add_sample(hdr, NULL);
+  if (bcf_hdr_write(fp, hdr) != 0) std::cerr << "Error: Failed to write BCF header!" << std::endl;
+
+  if (!svs.empty()) {
+    // Genotype arrays
+    int32_t *gts = (int*) malloc(bcf_hdr_nsamples(hdr) * 2 * sizeof(int));
+    float *gls = (float*) malloc(bcf_hdr_nsamples(hdr) * 3 * sizeof(float));
+    int32_t *rcl = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *rc = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *rcr = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *cnest = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *drcount = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *dvcount = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *rrcount = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *rvcount = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *gqval = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *hpcount = (int*) malloc(bcf_hdr_nsamples(hdr) * 4 * sizeof(int));
+    int32_t *psarr = (int*) malloc(bcf_hdr_nsamples(hdr) * sizeof(int));
+    int32_t *ma = (int32_t*) malloc(bcf_hdr_nsamples(hdr) * 4 * sizeof(int32_t));
+    int32_t *mr = (int32_t*) malloc(bcf_hdr_nsamples(hdr) * 4 * sizeof(int32_t));
+    int32_t *mnc = (int32_t*) malloc(bcf_hdr_nsamples(hdr) * 4 * sizeof(int32_t));
+    int32_t *mdv = (int32_t*) malloc(bcf_hdr_nsamples(hdr) * 4 * sizeof(int32_t));
+    int32_t *plvals = (int32_t*) malloc(bcf_hdr_nsamples(hdr) * 3 * sizeof(int32_t));
+    std::vector<std::string> ftarr;
+    ftarr.resize(bcf_hdr_nsamples(hdr));
+    
+    // Iterate all structural variants
+    typedef std::vector<TStructuralVariantRecord> TSVs;
+    now = boost::posix_time::second_clock::local_time();
+    std::cerr << '[' << boost::posix_time::to_simple_string(now) << "] " << "Genotyping" << std::endl;
+
+    // Multi-allelic loci
+    typedef std::map<int32_t, std::vector<int32_t> > TLocusMembers;
+    TLocusMembers locusMembers;
+    std::map<int32_t, std::vector<uint8_t> > gtClass;
+    for(typename TSVs::const_iterator svIter = svs.begin(); svIter!=svs.end(); ++svIter) {
+      if ((svIter->alleleid < 0) || (svIter->nallele < 2)) continue;
+      if ((svIter->srSupport == 0) && (svIter->peSupport == 0)) continue;
+      bool joint = false;
+      for(unsigned int file_c = 0; file_c < jctCountMap.size(); ++file_c) {
+	if (jctCountMap[file_c][svIter->id].joint) joint = true;
+      }
+      if (!joint) continue;
+      locusMembers[svIter->alleleid].push_back(svIter->id);
+      std::vector<uint8_t>& cls = gtClass[svIter->id];
+      cls.assign(jctCountMap.size(), 3);
+      for(unsigned int file_c = 0; file_c < jctCountMap.size(); ++file_c) {
+	uint8_t ploidy = 2;
+	if (file_c < c.sexModel.sex.size()) ploidy = _svPloidy(c.sexModel, c.sexModel.sex[file_c], svIter->chr, svIter->svStart, svIter->chr2, svIter->svEnd);
+	if ((ploidy != 2) || (!jctCountMap[file_c][svIter->id].joint)) continue;
+	if ((svIter->precise) && (jctCountMap[file_c][svIter->id].locusGt >= 0)) _locusGLs(jctCountMap[file_c][svIter->id], gls, gqval, gts, file_c, ploidy);
+	else if (svIter->precise) _computeGLs(bl, jctCountMap[file_c][svIter->id].ref, jctCountMap[file_c][svIter->id].alt, gls, gqval, gts, file_c, ploidy);
+	else _computeGLs(bl, spanCountMap[file_c][svIter->id].ref, spanCountMap[file_c][svIter->id].alt, gls, gqval, gts, file_c, ploidy);
+	if (gts[file_c * 2] == bcf_gt_missing) continue;
+	int32_t a0 = bcf_gt_allele(gts[file_c * 2]);
+	int32_t a1 = bcf_gt_allele(gts[file_c * 2 + 1]);
+	cls[file_c] = (uint8_t) (a0 + a1);
+      }
+    }
+
+    bcf1_t *rec = bcf_init();
+    for(typename TSVs::const_iterator svIter = svs.begin(); svIter!=svs.end(); ++svIter) {
+      if ((svIter->srSupport == 0) && (svIter->peSupport == 0)) continue;
+      // In discovery mode, skip SVs that have less than 2 reads support after genotyping
+      if (!c.hasVcfFile) {
+	uint32_t totalGtSup = 0;
+	for(unsigned int file_c = 0; file_c < jctCountMap.size(); ++file_c) {
+	  totalGtSup += spanCountMap[file_c][svIter->id].alt.size() + jctCountMap[file_c][svIter->id].alt.size();
+	}
+	if (totalGtSup < 2) continue;
+      }
+      
+      // Output main vcf fields
+      int32_t tmpi = bcf_hdr_id2int(hdr, BCF_DT_ID, "PASS");
+      if (svIter->chr == svIter->chr2) {
+	// Intra-chromosomal
+	if (((svIter->peSupport < 3) || (svIter->peMapQuality < 20)) && ((svIter->srSupport < 3) || (svIter->srMapQuality < 20))) tmpi = bcf_hdr_id2int(hdr, BCF_DT_ID, "LowQual");
+      } else {
+	// Inter-chromosomal
+	if (((svIter->peSupport < 5) || (svIter->peMapQuality < 20)) && ((svIter->srSupport < 5) || (svIter->srMapQuality < 20))) tmpi = bcf_hdr_id2int(hdr, BCF_DT_ID, "LowQual");
+      }
+      rec->rid = bcf_hdr_name2id(hdr, bamhd->target_name[svIter->chr]);
+      int32_t svStartPos = svIter->svStart - 1;
+      if (svStartPos < 0) svStartPos = 0;
+      int32_t svEndPos = svIter->svEnd;
+      if (svEndPos < 1) svEndPos = 1;
+      if (svEndPos > (int32_t) bamhd->target_len[svIter->chr2]) svEndPos = bamhd->target_len[svIter->chr2];
+      rec->pos = svStartPos;
+      std::string id(_addID(svIter->svt));
+      std::string padNumber = boost::lexical_cast<std::string>(svIter->id);
+      padNumber.insert(padNumber.begin(), 8 - padNumber.length(), '0');
+      id += padNumber;
+      bcf_update_id(hdr, rec, id.c_str());
+      std::string alleles = _replaceIUPAC(svIter->alleles);
+      bcf_update_alleles_str(hdr, rec, alleles.c_str());
+      bcf_update_filter(hdr, rec, &tmpi, 1);
+      
+      // Add INFO fields
+      if (svIter->precise) bcf_update_info_flag(hdr, rec, "PRECISE", NULL, 1);
+      else bcf_update_info_flag(hdr, rec, "IMPRECISE", NULL, 1);
+      bcf_update_info_string(hdr, rec, "SVTYPE", _addID(svIter->svt).c_str());
+      std::string dellyVersion("EMBL.DELLYv");
+      dellyVersion += dellyVersionNumber;
+      bcf_update_info_string(hdr,rec, "SVMETHOD", dellyVersion.c_str());
+      if (svIter->svt < DELLY_SVT_TRANS) {
+	size_t commaPos = alleles.find(',');
+	bool isSymbolic = (commaPos == std::string::npos);
+	if (!isSymbolic) {
+	  std::string alt = alleles.substr(commaPos + 1);
+	  isSymbolic = ((!alt.empty()) && ((alt[0] == '<') || (alt.find('[') != std::string::npos) || (alt.find(']') != std::string::npos)));
+	}
+	if (!isSymbolic) {
+	  tmpi = svStartPos + (int32_t)commaPos;  // svStartPos + len(REF)
+	} else {
+	  if (svEndPos < svStartPos + 1) svEndPos = svStartPos + 1;
+	  tmpi = svEndPos;
+	}
+	bcf_update_info_int32(hdr, rec, "END", &tmpi, 1);
+      } else {
+	tmpi = svStartPos + 1;
+	bcf_update_info_int32(hdr, rec, "END", &tmpi, 1);
+	bcf_update_info_string(hdr,rec, "CHR2", bamhd->target_name[svIter->chr2]);
+	tmpi = svEndPos;
+	bcf_update_info_int32(hdr, rec, "POS2", &tmpi, 1);
+      }
+      if (svIter->svt == 4) {
+	tmpi = svIter->insLen;
+	bcf_update_info_int32(hdr, rec, "SVLEN", &tmpi, 1);
+      } else if (svIter->svt == 2) {
+	tmpi = svIter->svStart - svIter->svEnd;
+	bcf_update_info_int32(hdr, rec, "SVLEN", &tmpi, 1);
+      } else if ((svIter->svt == 3) || (svIter->svt == 0) || (svIter->svt == 1)) {
+	tmpi = svIter->svEnd - svIter->svStart;
+	bcf_update_info_int32(hdr, rec, "SVLEN", &tmpi, 1);
+      }
+      tmpi = svIter->peSupport;
+      bcf_update_info_int32(hdr, rec, "PE", &tmpi, 1);
+      tmpi = svIter->peMapQuality;
+      bcf_update_info_int32(hdr, rec, "MAPQ", &tmpi, 1);
+      bcf_update_info_string(hdr, rec, "CT", _addOrientation(svIter->svt).c_str());
+      int32_t ciend[2];
+      ciend[0] = svIter->ciendlow;
+      ciend[1] = svIter->ciendhigh;
+      int32_t cipos[2];
+      cipos[0] = svIter->ciposlow;
+      cipos[1] = svIter->ciposhigh;
+      bcf_update_info_int32(hdr, rec, "CIPOS", cipos, 2);
+      bcf_update_info_int32(hdr, rec, "CIEND", ciend, 2);
+      if (svIter->alleleid >= 0) {
+	tmpi = svIter->alleleid;
+	bcf_update_info_int32(hdr, rec, "ALLELEID", &tmpi, 1);
+	tmpi = svIter->nallele;
+	bcf_update_info_int32(hdr, rec, "NALLELE", &tmpi, 1);
+      }
+      if (svIter->trStart >= 0) {
+	tmpi = svIter->trStart + 1;
+	bcf_update_info_int32(hdr, rec, "TRSTART", &tmpi, 1);
+	tmpi = svIter->trEnd;
+	bcf_update_info_int32(hdr, rec, "TREND", &tmpi, 1);
+      }
+
+      if (svIter->precise)  {
+	tmpi = svIter->srMapQuality;
+	bcf_update_info_int32(hdr, rec, "SRMAPQ", &tmpi, 1);
+	tmpi = svIter->insLen;
+	bcf_update_info_int32(hdr, rec, "INSLEN", &tmpi, 1);
+	tmpi = svIter->homLen;
+	bcf_update_info_int32(hdr, rec, "HOMLEN", &tmpi, 1);
+	tmpi = svIter->srSupport;
+	bcf_update_info_int32(hdr, rec, "SR", &tmpi, 1);
+	float tmpf = svIter->srAlignQuality;
+	bcf_update_info_float(hdr, rec, "SRQ", &tmpf, 1);
+	if (svIter->consensus.size()) {
+	  bcf_update_info_string(hdr, rec, "CONSENSUS", svIter->consensus.c_str());
+	  tmpf = entropy(svIter->consensus);
+	  bcf_update_info_float(hdr, rec, "CE", &tmpf, 1);
+	  tmpi = svIter->consBp;
+	  bcf_update_info_int32(hdr, rec, "CONSBP", &tmpi, 1);
+	}
+      }
+
+      // SVAnno fields: reference-based breakpoint homology and MEI/NUMT annotation
+      if (!_translocation(svIter->svt)) {
+	if (svIter->anno.homLen > 0) {
+	  // Overwrite old homology computation
+	  tmpi = svIter->anno.homLen;
+	  bcf_update_info_int32(hdr, rec, "HOMLEN", &tmpi, 1);
+	}
+	if (svIter->anno.seqType > 0 && svIter->anno.seqType < 7) {
+	  static const char* seqTypeStr[] = {"", "INS:ME:ALU", "INS:ME:LINE1", "INS:ME:SVA", "INS:NUMT", "INS:LTR", "INS:HERVK"};
+	  bcf_update_info_string(hdr, rec, "SUBTYPE", seqTypeStr[svIter->anno.seqType]);
+	  static const char* strandTypeStr[] = {"+", "-"};
+	  if (svIter->anno.isRC) bcf_update_info_string(hdr, rec, "INSSTRAND", strandTypeStr[1]);
+	  else bcf_update_info_string(hdr, rec, "INSSTRAND", strandTypeStr[0]);
+	} else if (svIter->anno.seqType == 7) {
+	  std::string subtypeStr = (svIter->svt == 4) ? "INS:TR" : "DEL:TR";
+	  bcf_update_info_string(hdr, rec, "SUBTYPE", subtypeStr.c_str());
+	  tmpi = svIter->anno.trPeriod;
+	  bcf_update_info_int32(hdr, rec, "TRPERIOD", &tmpi, 1);
+	  float tmpf = svIter->anno.trCopies;
+	  bcf_update_info_float(hdr, rec, "TRCOPIES", &tmpf, 1);
+	} else if ((svIter->trStart >= 0) && (svIter->nallele > 1) && ((svIter->svt == 2) || (svIter->svt == 4))) {
+	  // Multi-allelic TR
+	  std::string subtypeStr = (svIter->svt == 4) ? "INS:TR" : "DEL:TR";
+	  bcf_update_info_string(hdr, rec, "SUBTYPE", subtypeStr.c_str());
+	}
+      }
+
+      // Add genotype columns
+      for(unsigned int file_c = 0; file_c < jctCountMap.size(); ++file_c) {
+	// Counters
+	rcl[file_c] = 0;
+	rc[file_c] = 0;
+	rcr[file_c] = 0;
+	cnest[file_c] = 0;
+	drcount[file_c] = 0;
+	dvcount[file_c] = 0;
+	rrcount[file_c] = 0;
+	rvcount[file_c] = 0;
+	drcount[file_c] = spanCountMap[file_c][svIter->id].ref.size();
+	dvcount[file_c] = spanCountMap[file_c][svIter->id].alt.size();
+	rrcount[file_c] = jctCountMap[file_c][svIter->id].ref.size();
+	rvcount[file_c] = jctCountMap[file_c][svIter->id].alt.size();
+	// HP-stratified junction counts
+	hpcount[file_c * 4 + 0] = jctCountMap[file_c][svIter->id].hp1ref.size();
+	hpcount[file_c * 4 + 1] = jctCountMap[file_c][svIter->id].hp1alt.size();
+	hpcount[file_c * 4 + 2] = jctCountMap[file_c][svIter->id].hp2ref.size();
+	hpcount[file_c * 4 + 3] = jctCountMap[file_c][svIter->id].hp2alt.size();
+	psarr[file_c] = jctCountMap[file_c][svIter->id].ps;
+	
+	// Methylation
+	if ((!methylMap.empty()) && (file_c < methylMap.size()) && (svIter->id < (int32_t)methylMap[file_c].size())) {
+	  const MethylInfo& mi = methylMap[file_c][svIter->id];
+	  bool isIns = (svIter->svt == 4);
+	  bool isDel = (svIter->svt == 2);
+
+	  // Percent methylation
+	  auto mout = [&](int32_t pct, int32_t depth) -> int32_t {
+	    if ((pct < 0) || (depth < 0) || ((uint32_t)depth < _getMinCpgDepth(c))) return bcf_int32_missing;
+	    return pct;
+	  };
+	  auto ncout = [](int32_t v) -> int32_t {
+	    return (v < 0) ? bcf_int32_missing : v;
+	  };
+
+	  // MNC and MDV (combined REF+ALT)
+	  mnc[file_c*4+0] = ncout(mi.mncStartL);
+	  mnc[file_c*4+1] = ncout(mi.mncStartR);
+	  mnc[file_c*4+2] = ncout(mi.mncRightL);
+	  mnc[file_c*4+3] = ncout(mi.mncRightR);
+	  mdv[file_c*4+0] = ncout(mi.mdpStartL);
+	  mdv[file_c*4+1] = ncout(mi.mdpStartR);
+	  mdv[file_c*4+2] = ncout(mi.mdpRightL);
+	  mdv[file_c*4+3] = ncout(mi.mdpRightR);
+
+	  // MA: ALT allele
+	  ma[file_c*4+0] = mout(mi.altSvStartL, mi.mdpStartL);
+	  ma[file_c*4+1] = isDel ? bcf_int32_missing : mout(mi.altSvStartR, mi.mdpStartR);
+	  ma[file_c*4+2] = isDel ? bcf_int32_missing : mout(mi.altSvRightL, mi.mdpRightL);
+	  ma[file_c*4+3] = mout(mi.altSvRightR, mi.mdpRightR);
+
+	  // MR: REF allele
+	  mr[file_c*4+0] = mout(mi.refSvStartL, mi.mdpStartL);
+	  mr[file_c*4+1] = isIns ? bcf_int32_missing : mout(mi.refSvStartR, mi.mdpStartR);
+	  mr[file_c*4+2] = isIns ? bcf_int32_missing : mout(mi.refSvRightL, mi.mdpRightL);
+	  mr[file_c*4+3] = mout(mi.refSvRightR, mi.mdpRightR);
+	} else {
+	  for (int k = 0; k < 4; ++k) {
+	    ma[file_c*4+k] = bcf_int32_missing;
+	    mr[file_c*4+k] = bcf_int32_missing;
+	    mnc[file_c*4+k] = bcf_int32_missing;
+	    mdv[file_c*4+k] = bcf_int32_missing;
+	  }
+	}
+
+	// Sample ploidy
+	uint8_t ploidy = 2;
+	if (file_c < c.sexModel.sex.size()) {
+	  ploidy = _svPloidy(c.sexModel, c.sexModel.sex[file_c], svIter->chr, svIter->svStart, svIter->chr2, svIter->svEnd);
+	}
+
+	// Compute GLs
+	if ((svIter->precise) && (jctCountMap[file_c][svIter->id].locusGt >= 0)) _locusGLs(jctCountMap[file_c][svIter->id], gls, gqval, gts, file_c, ploidy);
+	else if (svIter->precise) _computeGLs(bl, jctCountMap[file_c][svIter->id].ref, jctCountMap[file_c][svIter->id].alt, gls, gqval, gts, file_c, ploidy);
+	else _computeGLs(bl, spanCountMap[file_c][svIter->id].ref, spanCountMap[file_c][svIter->id].alt, gls, gqval, gts, file_c, ploidy);
+
+	// Compute PLs
+	if (gts[file_c * 2] == bcf_gt_missing) {
+	  for (int32_t k = 0; k < 3; ++k) {
+	    float *gl_ptr = gls + file_c * 3 + k;
+	    bcf_float_set_missing(*gl_ptr);
+	    plvals[file_c * 3 + k] = bcf_int32_missing;
+	  }
+	} else if (ploidy == 1) {
+	  // Haploid
+	  plvals[file_c * 3] = (int32_t) std::max(0.0f, std::round(-10.0f * gls[file_c * 3]));
+	  plvals[file_c * 3 + 1] = (int32_t) std::max(0.0f, std::round(-10.0f * gls[file_c * 3 + 2]));
+	  plvals[file_c * 3 + 2] = bcf_int32_vector_end;
+	} else {
+	  for (int32_t k = 0; k < 3; ++k) {
+	    float gl_val = gls[file_c * 3 + k];
+	    plvals[file_c * 3 + k] = (int32_t) std::max(0.0f, std::round(-10.0f * gl_val));
+	  }
+	}
+
+	// Phase het genotypes
+	if ((ploidy == 2) && (psarr[file_c] != -1)) {
+	  int32_t hp1a = hpcount[file_c * 4 + 1];
+	  int32_t hp2a = hpcount[file_c * 4 + 3];
+	  bool isHet = (gts[file_c * 2] == bcf_gt_unphased(0) && gts[file_c * 2 + 1] == bcf_gt_unphased(1));
+	  if (isHet && (hp1a + hp2a) > 0 && hp1a != hp2a) {
+	    if (hp1a > hp2a) {
+	      gts[file_c * 2] = bcf_gt_phased(1);
+	      gts[file_c * 2 + 1] = bcf_gt_phased(0);
+	    } else {
+	      gts[file_c * 2] = bcf_gt_phased(0);
+	      gts[file_c * 2 + 1] = bcf_gt_phased(1);
+	    }
+	  }
+	}
+
+	// Compound het
+	if ((ploidy == 2) && (psarr[file_c] == -1) && (gtClass.find(svIter->id) != gtClass.end())) {
+	  bool isHet = (gts[file_c * 2] == bcf_gt_unphased(0) && gts[file_c * 2 + 1] == bcf_gt_unphased(1));
+	  if (isHet) {
+	    std::vector<int32_t> const& mem = locusMembers[svIter->alleleid];
+	    int32_t nHet = 0;
+	    int32_t nOtherAlt = 0;
+	    int32_t firstHet = -1;
+	    for(uint32_t k = 0; k < mem.size(); ++k) {
+	      uint8_t cl = gtClass[mem[k]][file_c];
+	      if (cl == 1) { ++nHet; if (firstHet < 0) firstHet = mem[k]; }
+	      else if (cl == 2) ++nOtherAlt;
+	    }
+	    if ((nHet == 2) && (nOtherAlt == 0)) {
+	      if (svIter->id == firstHet) {
+		gts[file_c * 2] = bcf_gt_phased(1);
+		gts[file_c * 2 + 1] = bcf_gt_phased(0);
+	      } else {
+		gts[file_c * 2] = bcf_gt_phased(0);
+		gts[file_c * 2 + 1] = bcf_gt_phased(1);
+	      }
+	      psarr[file_c] = svIter->alleleid;
+	    }
+	  }
+	}
+	
+	// Compute RCs
+	rcl[file_c] = readCountMap[file_c][svIter->id].leftRC;
+	rc[file_c] = readCountMap[file_c][svIter->id].rc;
+	rcr[file_c] = readCountMap[file_c][svIter->id].rightRC;
+	cnest[file_c] = -1;
+	if (((rcl[file_c] + rcr[file_c]) > 0) && (ploidy > 0)) {
+	  double cn = (double) ploidy * (double) rc[file_c] / (double) (rcl[file_c] + rcr[file_c]);
+	  if (cn < 0) cn = 0;
+	  if (cn > 100000) cn = 100000; // guard int32 overflow in iround
+	  cnest[file_c] = boost::math::iround(cn);
+	}
+      
+	// Genotype filter
+	if (gqval[file_c] < 15) ftarr[file_c] = "LowQual";
+	else ftarr[file_c] = "PASS";
+      }
+      int32_t qvalout = svIter->mapq;
+      if (qvalout < 0) qvalout = 0;
+      if (qvalout > 10000) qvalout = 10000;
+      rec->qual = qvalout;
+      
+      // Allele count
+      {
+	int32_t acCount = 0;
+	int32_t anCount = 0;
+	for(int32_t k = 0; k < bcf_hdr_nsamples(hdr) * 2; ++k) {
+	  if ((gts[k] == bcf_int32_vector_end) || (bcf_gt_is_missing(gts[k]))) continue;
+	  ++anCount;
+	  if (bcf_gt_allele(gts[k]) > 0) ++acCount;
+	}
+	bcf_update_info_int32(hdr, rec, "AC", &acCount, 1);
+	bcf_update_info_int32(hdr, rec, "AN", &anCount, 1);
+      }
+      bcf_update_genotypes(hdr, rec, gts, bcf_hdr_nsamples(hdr) * 2);
+      //bcf_update_format_float(hdr, rec, "GL",  gls, bcf_hdr_nsamples(hdr) * 3);
+      bcf_update_format_int32(hdr, rec, "GQ", gqval, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "PL", plvals, bcf_hdr_nsamples(hdr) * 3);
+      std::vector<const char*> strp(bcf_hdr_nsamples(hdr));
+      std::transform(ftarr.begin(), ftarr.end(), strp.begin(), cstyle_str());
+      bcf_update_format_string(hdr, rec, "FT", &strp[0], bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "RCL", rcl, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "RC", rc, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "RCR", rcr, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "RDCN", cnest, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "DR", drcount, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "DV", dvcount, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "RR", rrcount, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "RV", rvcount, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "HP", hpcount, bcf_hdr_nsamples(hdr) * 4);
+      bcf_update_format_int32(hdr, rec, "PS", psarr, bcf_hdr_nsamples(hdr));
+      bcf_update_format_int32(hdr, rec, "MR", mr, bcf_hdr_nsamples(hdr) * 4);
+      bcf_update_format_int32(hdr, rec, "MA", ma, bcf_hdr_nsamples(hdr) * 4);
+      bcf_update_format_int32(hdr, rec, "MNC", mnc, bcf_hdr_nsamples(hdr) * 4);
+      bcf_update_format_int32(hdr, rec, "MDV", mdv, bcf_hdr_nsamples(hdr) * 4);
+      bcf_write1(fp, hdr, rec);
+      bcf_clear1(rec);
+    }
+    bcf_destroy1(rec);
+    
+    // Clean-up
+    free(gts);
+    free(gls);
+    free(plvals);
+    free(rcl);
+    free(rc);
+    free(rcr);
+    free(cnest);
+    free(drcount);
+    free(dvcount);
+    free(rrcount);
+    free(rvcount);
+    free(gqval);
+    free(hpcount);
+    free(psarr);
+    free(ma);
+    free(mr);
+    free(mnc);
+    free(mdv);
+  }
+
+  // Close BAM file
+  bam_hdr_destroy(bamhd);
+  sam_close(samfile);
+
+  // Close VCF file
+  bcf_hdr_destroy(hdr);
+  hts_close(fp);
+
+  // Build index
+  if (c.outfile.string() != "-") bcf_index_build(c.outfile.string().c_str(), 14);
+}
+
+  template<typename TConfig, typename TStructuralVariantRecord, typename TJunctionCountMap, typename TReadCountMap, typename TCountMap>
+  inline void
+  vcfOutput(TConfig const& c, std::vector<TStructuralVariantRecord> const& svs, TJunctionCountMap const& jctCountMap, TReadCountMap const& readCountMap, TCountMap const& spanCountMap) {
+    typedef std::vector<MethylInfo> TSVMethylInfo;
+    typedef std::vector<TSVMethylInfo> TSampleMethylInfo;
+    TSampleMethylInfo methylMap;
+    vcfOutput(c, svs, jctCountMap, readCountMap, spanCountMap, methylMap);
+  }
+
+}
+
+#endif

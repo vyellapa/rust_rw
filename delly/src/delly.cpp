@@ -1,0 +1,87 @@
+#define _SECURE_SCL 0
+#define _SCL_SECURE_NO_WARNINGS
+#include <iostream>
+#include <fstream>
+
+#define BOOST_DISABLE_ASSERTS
+#define BOOST_UUID_RANDOM_PROVIDER_FORCE_POSIX
+
+#ifdef PROFILE
+#include "gperftools/profiler.h"
+#endif
+
+#include "version.h"
+#include "delly.h"
+#include "filter.h"
+#include "merge.h"
+#include "tegua.h"
+#include "coral.h"
+#include "asmode.h"
+
+using namespace torali;
+
+
+inline void
+displayUsage() {
+  std::cerr << "Usage: delly <command> <arguments>" << std::endl;
+  std::cerr << std::endl;
+  std::cerr << "SV/CNV calling:" << std::endl;
+  std::cerr << "    sr           short-read SV discovery" << std::endl;
+  std::cerr << "    lr           long-read SV discovery" << std::endl;
+  std::cerr << "    asm          assembly-based SV discovery" << std::endl;
+  std::cerr << "    cnv          short- or long-read CNV discovery" << std::endl;
+  std::cerr << std::endl;
+  std::cerr << "SV/CNV merging and filtering:" << std::endl;
+  std::cerr << "    merge        merge variants" << std::endl;
+  std::cerr << "    filter       filter somatic or germline variants" << std::endl;
+  std::cerr << std::endl;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { 
+      printTitle("Delly");
+      displayUsage();
+      return 0;
+    }
+
+    if ((std::string(argv[1]) == "version") || (std::string(argv[1]) == "--version") || (std::string(argv[1]) == "--version-only") || (std::string(argv[1]) == "-v")) {
+      std::cerr << "Delly version: v" << dellyVersionNumber << std::endl;
+      std::cerr << " using Boost: v" << BOOST_VERSION / 100000 << "." << BOOST_VERSION / 100 % 1000 << "." << BOOST_VERSION % 100 << std::endl;
+      std::cerr << " using HTSlib: v" << hts_version() << std::endl;
+      return 0;
+    }
+    else if ((std::string(argv[1]) == "help") || (std::string(argv[1]) == "--help") || (std::string(argv[1]) == "-h") || (std::string(argv[1]) == "-?")) {
+      printTitle("Delly");
+      displayUsage();
+      return 0;
+    }
+    else if ((std::string(argv[1]) == "warranty") || (std::string(argv[1]) == "--warranty") || (std::string(argv[1]) == "-w")) {
+      displayWarranty();
+      return 0;
+    }
+    else if ((std::string(argv[1]) == "license") || (std::string(argv[1]) == "--license") || (std::string(argv[1]) == "-l")) {
+      bsd();
+      return 0;
+    }
+    else if ((std::string(argv[1]) == "sr")) {
+      return delly(argc-1,argv+1);
+    }
+    else if ((std::string(argv[1]) == "lr")) {
+      return tegua(argc-1,argv+1);
+    }
+    else if ((std::string(argv[1]) == "asm")) {
+      return asmode(argc-1,argv+1);
+    }
+    else if ((std::string(argv[1]) == "cnv")) {
+      return coral(argc-1,argv+1);
+    }
+    else if ((std::string(argv[1]) == "filter")) {
+      return filter(argc-1,argv+1);
+    }
+    else if ((std::string(argv[1]) == "merge")) {
+      return merge(argc-1,argv+1);
+    }
+    std::cerr << "Unrecognized command " << std::string(argv[1]) << std::endl;
+    return 1;
+}
+

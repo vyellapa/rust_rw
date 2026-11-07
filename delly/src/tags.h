@@ -1,0 +1,378 @@
+#ifndef TAGS_H
+#define TAGS_H
+
+namespace torali {
+
+  #ifndef DELLY_SVT_TRANS
+  #define DELLY_SVT_TRANS 5
+  #endif
+
+  #ifndef DELLY_OUTOFBAND
+  #define DELLY_OUTOFBAND -99999999
+  #endif
+
+  #ifndef DELLY_DUPLICATE
+  #define DELLY_DUPLICATE std::numeric_limits<uint32_t>::max()
+  #endif
+
+  #ifndef DELLY_KMER
+  #define DELLY_KMER 7
+  #endif
+
+  inline bool
+  _translocation(int32_t const svt) {
+    return (DELLY_SVT_TRANS <= svt) && (svt < 9);
+  }
+
+  inline bool
+  _translocation(bam1_t* rec) {
+    return (rec->core.tid != rec->core.mtid);
+  }
+  
+  // Deletions
+  inline uint8_t
+  _getSpanOrientation(int32_t const svt) {
+    if (_translocation(svt)) {
+      return svt - DELLY_SVT_TRANS;
+    } else {
+      return svt;
+    }
+  }
+
+  // Junction record
+  struct Junction {
+    bool forward;
+    bool scleft;
+    int32_t refidx;
+    int32_t rstart;
+    int32_t refpos;
+    int32_t seqpos;
+    uint16_t qual;
+
+    Junction(bool const fw, bool const cl, int32_t const idx, int32_t const rst, int32_t const r, int32_t const s, uint16_t const qval) : forward(fw), scleft(cl), refidx(idx), rstart(rst), refpos(r), seqpos(s), qual(qval) {}
+
+    bool operator<(const Junction& j2) const {
+      if (seqpos != j2.seqpos) return (seqpos < j2.seqpos);
+      if (refidx != j2.refidx) return (refidx < j2.refidx);
+      if (refpos != j2.refpos) return (refpos < j2.refpos);
+      if (scleft != j2.scleft) return (scleft < j2.scleft);
+      if (rstart != j2.rstart) return (rstart < j2.rstart);
+      if (forward != j2.forward) return (forward < j2.forward);
+      return (qual < j2.qual);
+    }
+  };
+  
+
+
+  // Split-read record
+  struct SRBamRecord {
+    int32_t chr;
+    int32_t pos;
+    int32_t chr2;
+    int32_t pos2;
+    int32_t rstart;
+    int32_t sstart;
+    int32_t qual;
+    int32_t inslen;
+    int32_t svid;
+    int32_t primaryChr;
+    std::size_t id;
+        
+    SRBamRecord(int32_t const c, int32_t const p, int32_t const c2, int32_t const p2, int32_t const rst, int32_t const sst, int32_t const qval, int32_t const il, std::size_t const idval) : chr(c), pos(p), chr2(c2), pos2(p2), rstart(rst), sstart(sst), qual(qval), inslen(il), svid(-1), primaryChr(-1), id(idval) {}
+
+    bool operator<(const SRBamRecord& sv2) const {
+      if (chr != sv2.chr) return (chr < sv2.chr);
+      if (pos != sv2.pos) return (pos < sv2.pos);
+      if (chr2 != sv2.chr2) return (chr2 < sv2.chr2);
+      if (pos2 != sv2.pos2) return (pos2 < sv2.pos2);
+      if (rstart != sv2.rstart) return (rstart < sv2.rstart);
+      if (sstart != sv2.sstart) return (sstart < sv2.sstart);
+      if (inslen != sv2.inslen) return (inslen < sv2.inslen);
+      if (qual != sv2.qual) return (qual < sv2.qual);
+      return (id < sv2.id);
+    }
+  };
+
+  struct SVAnno {
+    bool isRC;
+    int32_t seqType; // 0: No assignment, 1: ALU, 2: Line1, 3: SVA, 4: NUMT, 5: LTR, 6: HERVK, 7: Tandem Repeat
+    int32_t homLen;  // Breakpoint homology / TSD length
+    int32_t trPeriod; // Tandem repeat period in bp
+    float trCopies;   // Tandem repeat copy number
+    bool fromSites;   // annotation present
+    
+    SVAnno() : isRC(false), seqType(0), homLen(0), trPeriod(0), trCopies(0.0f), fromSites(false) {}
+  };
+  
+  // Structural variant record
+  struct StructuralVariantRecord {
+    int32_t chr;
+    int32_t svStart;
+    int32_t chr2;
+    int32_t svEnd;
+    int32_t ciposlow;
+    int32_t ciposhigh;
+    int32_t ciendlow;
+    int32_t ciendhigh;
+    int32_t srSupport;
+    int32_t srMapQuality;
+    int32_t mapq;
+    int32_t insLen;
+    int32_t svt;
+    int32_t id;
+    int32_t homLen;
+    int32_t peSupport;
+    int32_t peMapQuality;
+    int32_t consBp;
+    int32_t alleleid;
+    int32_t nallele;
+    int32_t trStart;
+    int32_t trEnd;
+    float srAlignQuality;
+    bool precise;
+    std::string alleles;
+    std::string consensus;
+    SVAnno anno;
+    
+    StructuralVariantRecord() : chr(0), svStart(0), chr2(0), svEnd(0), ciposlow(0), ciposhigh(0), ciendlow(0), ciendhigh(0), srSupport(0), srMapQuality(0), mapq(0), insLen(0), svt(-1), id(0), homLen(0), peSupport(0), peMapQuality(0), consBp(0), alleleid(-1), nallele(1), trStart(-1), trEnd(-1), srAlignQuality(0), precise(false) {}
+
+    StructuralVariantRecord(int32_t const c, int32_t const s, int32_t const e) : chr(c), svStart(s), chr2(c), svEnd(e), ciposlow(0), ciposhigh(0), ciendlow(0), ciendhigh(0), srSupport(0), srMapQuality(0), mapq(0), insLen(0), svt(-1), id(0), homLen(0), peSupport(0), peMapQuality(0), consBp(0), alleleid(-1), nallele(1), trStart(-1), trEnd(-1), srAlignQuality(0), precise(false) {}
+
+    StructuralVariantRecord(int32_t const c1, int32_t const s, int32_t const c2, int32_t const e, int32_t const cipl, int32_t const ciph, int32_t const ciel, int32_t const cieh, int32_t const sup, int32_t const srmapq, int32_t const qval, int32_t const ilen, int32_t const svtype, int32_t const idval): chr(c1), svStart(s), chr2(c2), svEnd(e), ciposlow(cipl), ciposhigh(ciph), ciendlow(ciel), ciendhigh(cieh), srSupport(sup), srMapQuality(srmapq), mapq(qval), insLen(ilen), svt(svtype), id(idval), homLen(0), peSupport(0), peMapQuality(0), consBp(0), alleleid(-1), nallele(1), trStart(-1), trEnd(-1), srAlignQuality(0), precise(true) {}
+
+    bool operator<(const StructuralVariantRecord& sv2) const {
+      if (chr != sv2.chr) return (chr < sv2.chr);
+      if (svStart != sv2.svStart) return (svStart < sv2.svStart);
+      if (chr2 != sv2.chr2) return (chr2 < sv2.chr2);
+      if (svEnd != sv2.svEnd) return (svEnd < sv2.svEnd);
+      if (peSupport != sv2.peSupport) return (peSupport > sv2.peSupport);
+      if (srSupport != sv2.srSupport) return (srSupport > sv2.srSupport);
+      if (svt != sv2.svt) return (svt < sv2.svt);
+      if (insLen != sv2.insLen) return (insLen < sv2.insLen);
+      if (mapq != sv2.mapq) return (mapq > sv2.mapq);
+      if (srMapQuality != sv2.srMapQuality) return (srMapQuality > sv2.srMapQuality);
+      return (consensus < sv2.consensus);
+    }
+    
+  };
+
+  struct Breakpoint {
+    int32_t svStartBeg;
+    int32_t svStartEnd;
+    int32_t svEndBeg;
+    int32_t svEndEnd;
+    int32_t svStart;
+    int32_t svEnd;
+    int32_t peSupport;
+    int32_t svt;
+    int32_t chr;
+    int32_t chr2;
+    std::string part1;
+
+    Breakpoint() : svStartBeg(0), svStartEnd(0), svEndBeg(0), svEndEnd(0), svStart(0), svEnd(0), peSupport(0), svt(-1), chr(0), chr2(0) {}
+    explicit Breakpoint(StructuralVariantRecord const& sv) : svStartBeg(sv.svStart), svStartEnd(sv.svStart), svEndBeg(sv.svEnd), svEndEnd(sv.svEnd), svStart(sv.svStart), svEnd(sv.svEnd), peSupport(sv.peSupport), svt(sv.svt), chr(sv.chr), chr2(sv.chr2) {}
+    
+  };
+
+  // Initialize breakpoint
+  template<typename TBreakpoint>
+  inline void
+  _initBreakpoint(bam_hdr_t const* hdr, TBreakpoint& bp, int32_t const boundary, int32_t const svt) {
+    if (_translocation(svt)) {
+        bp.svStartBeg = std::max(0, bp.svStart - boundary);
+	bp.svStartEnd = std::min((int32_t) (hdr->target_len[bp.chr]), bp.svStart + boundary);
+	bp.svEndBeg = std::max(0, bp.svEnd - boundary);
+	bp.svEndEnd = std::min((int32_t) (hdr->target_len[bp.chr2]), bp.svEnd + boundary);
+    } else {
+      if (svt == 4) {
+	bp.svStartBeg = std::max(0, bp.svStart - boundary);
+	bp.svStartEnd = std::min((int32_t) (hdr->target_len[bp.chr]), bp.svStart + boundary);
+	bp.svEndBeg = std::max(0, bp.svEnd - boundary);
+	bp.svEndEnd = std::min((int32_t) (hdr->target_len[bp.chr2]), bp.svEnd + boundary);
+      } else {
+	bp.svStartBeg = std::max(0, bp.svStart - boundary);
+	bp.svStartEnd = std::min(bp.svStart + boundary, (bp.svStart + bp.svEnd)/2);
+	bp.svEndBeg = std::max((bp.svStart + bp.svEnd)/2 + 1, bp.svEnd - boundary);
+	bp.svEndEnd = std::min((int32_t) (hdr->target_len[bp.chr2]), bp.svEnd + boundary);
+      }
+    }
+  }
+  
+  template<typename TPos>
+  inline TPos
+  _minCoord(TPos const position, TPos const matePosition, int32_t const svt) {
+    if (_translocation(svt)) return position;
+    else return std::min(position, matePosition);
+  }
+
+  template<typename TPos>
+  inline TPos
+  _maxCoord(TPos const position, TPos const matePosition, int32_t const svt) {
+    if (_translocation(svt)) return matePosition;
+    else return std::max(position, matePosition);
+  }
+
+
+  template<typename TSize>
+  inline bool
+  _svSizeCheck(TSize const s, TSize const e, int32_t const svt) {
+    // Short reads
+    if (svt == 0) return (( e - s ) >= 300);
+    else if (svt == 1) return (( e - s ) >= 300);
+    else if (svt == 2) return (( e - s ) >= 300);
+    else if (svt == 3) return (( e - s ) >= 100);
+    else return true;
+  }
+
+  template<typename TSize>
+  inline bool
+  _svSizeCheck(TSize const s, TSize const e, int32_t const svt, int32_t const inslen) {
+    // Long reads
+    if (svt == 0) return (( e - s ) >= 15);
+    else if (svt == 1) return (( e - s ) >= 15);
+    else if (svt == 2) return (( e - s ) >= 15);
+    else if (svt == 3) return (( e - s ) >= 15);
+    else if (svt == 4) return (inslen >= 15);
+    else return true;
+  }
+
+
+  // 0: Left-spanning inversion
+  // 1: Right-spanning inversion
+  // 2: Deletion-type
+  // 3: Duplication-type
+
+  inline uint8_t
+  getSVType(bam1_t* rec) {
+    if (!(rec->core.flag & BAM_FREVERSE)) {
+      if (!(rec->core.flag & BAM_FMREVERSE)) return 0;
+      else return (rec->core.pos < rec->core.mpos) ? 2 : 3;
+    } else {
+      if (!(rec->core.flag & BAM_FMREVERSE)) return (rec->core.pos > rec->core.mpos) ? 2 : 3;
+      else return 1;
+    }
+  }
+
+  inline int32_t
+  _isizeMappingPos(bam1_t* rec, int32_t isize) {
+    if (_translocation(rec)) {
+      uint8_t orient = getSVType(rec);
+      if (orient == 0) return DELLY_SVT_TRANS + 0;
+      else if (orient == 1) return DELLY_SVT_TRANS + 1;
+      else {
+	// 3to5 or 5to3?
+	if (rec->core.tid > rec->core.mtid) {
+	  if (!(rec->core.flag & BAM_FREVERSE)) return DELLY_SVT_TRANS + 2;
+	  else return DELLY_SVT_TRANS + 3;
+	} else {
+	  if (!(rec->core.flag & BAM_FREVERSE)) return DELLY_SVT_TRANS + 3;
+	  else return DELLY_SVT_TRANS + 2;
+	}
+      }
+    } else {
+      if (rec->core.pos == rec->core.mpos) return -1; // No SV
+      uint8_t orient = getSVType(rec);
+      if (orient == 0) return 0;
+      else if (orient == 1) return 1;
+      else if (orient == 2) {
+	if (isize > std::abs(rec->core.isize)) return -1;
+	else return 2;
+      } else {
+	if (std::abs(rec->core.pos - rec->core.mpos) < 100) return -1; // Too small
+	return 3;
+      }
+    }
+  }
+
+  inline unsigned hash_string(const char *s) {
+    unsigned h = 37;
+    while (*s) {
+      h = (h * 54059) ^ (s[0] * 76963);
+      s++;
+    }
+    return h;
+  }
+  
+  template<typename TAlignedReads>
+  inline bool
+  _firstPairObs(bam1_t* rec, TAlignedReads const& lastAlignedPosReads) {
+    if (rec->core.tid == rec->core.mtid) return ((rec->core.pos < rec->core.mpos) || ((rec->core.pos == rec->core.mpos) && (lastAlignedPosReads.find(hash_string(bam_get_qname(rec))) == lastAlignedPosReads.end())));
+    else return (rec->core.tid < rec->core.mtid);
+  }
+
+  // Deletions
+  template<typename TSize, typename TISize>
+  inline bool
+  _pairsDisagree(TSize const pair1Min, TSize const pair1Max, TSize const pair1ReadLength, TISize const pair1maxNormalISize, TSize const pair2Min, TSize const pair2Max, TSize const pair2ReadLength, TISize const pair2maxNormalISize, int32_t const svt) {
+    if (_translocation(svt)) {
+      uint8_t ct = _getSpanOrientation(svt);
+
+      // Check read offsets
+      if (ct%2==0) {
+	if ((pair2Min + pair2ReadLength - pair1Min) > pair1maxNormalISize) return true;
+	if (ct>=2) {
+	  if (pair2Max < pair1Max) {
+	    if ((pair1Max + pair1ReadLength - pair2Max) > pair1maxNormalISize) return true;
+	  } else {
+	    if ((pair2Max + pair2ReadLength - pair1Max) > pair2maxNormalISize) return true;
+	  }
+	} else {
+	  if (pair2Max < pair1Max) {
+	    if ((pair1Max + pair1ReadLength - pair2Max) > pair2maxNormalISize) return true;
+	  } else {
+	    if ((pair2Max + pair2ReadLength - pair1Max) > pair1maxNormalISize) return true;
+	  }
+	}
+      } else {
+	if ((pair2Min + pair2ReadLength - pair1Min) > pair2maxNormalISize) return true;
+	if (ct>=2) {
+	  if (pair2Max < pair1Max) {
+	    if ((pair1Max + pair1ReadLength - pair2Max) > pair2maxNormalISize) return true;
+	  } else {
+	    if ((pair2Max + pair2ReadLength - pair1Max) > pair1maxNormalISize) return true;
+	  }
+	} else {
+	  if (pair2Max < pair1Max) {
+	    if ((pair1Max + pair1ReadLength - pair2Max) > pair1maxNormalISize) return true;
+	  } else {
+	    if ((pair2Max + pair2ReadLength - pair1Max) > pair2maxNormalISize) return true;
+	  }
+	}
+      }
+      return false;
+    } else {
+      if (svt < 2) {
+	// Inversion
+	if (!svt) {
+	  // Left-spanning inversions
+	  if ((pair2Min + pair2ReadLength - pair1Min) > pair1maxNormalISize) return true;
+	  if ((pair2Max < pair1Max) && ((pair1Max + pair1ReadLength - pair2Max) > pair2maxNormalISize)) return true;
+	  if ((pair2Max >= pair1Max) && ((pair2Max + pair2ReadLength - pair1Max) > pair1maxNormalISize)) return true;
+	} else {
+	  // Right-spanning inversions
+	  if ((pair2Min + pair2ReadLength - pair1Min) > pair2maxNormalISize) return true;
+	  if ((pair2Max < pair1Max) && ((pair1Max + pair1ReadLength - pair2Max) > pair1maxNormalISize)) return true;
+	  if ((pair2Max >= pair1Max) && ((pair2Max + pair2ReadLength - pair1Max) > pair2maxNormalISize)) return true;
+	}
+	return false;
+      } else if (svt == 2) {
+	// Deletion
+	if ((pair2Min + pair2ReadLength - pair1Min) > pair1maxNormalISize) return true;
+	if ((pair2Max < pair1Max) && ((pair1Max + pair1ReadLength - pair2Max) > pair1maxNormalISize)) return true;
+	if ((pair2Max >= pair1Max) && ((pair2Max + pair2ReadLength - pair1Max) > pair2maxNormalISize)) return true;
+	if ((pair1Max < pair2Min) || (pair2Max < pair1Min)) return true;
+	return false;
+      } else if (svt == 3) {
+	if ((pair2Min + pair2ReadLength - pair1Min) > pair2maxNormalISize) return true;
+	if ((pair2Max < pair1Max) && ((pair1Max + pair1ReadLength - pair2Max) > pair2maxNormalISize)) return true;
+	if ((pair2Max >= pair1Max) && ((pair2Max + pair2ReadLength - pair1Max) > pair1maxNormalISize)) return true;
+	return false;
+      }
+    }
+    return false;
+  }
+
+
+}
+
+#endif

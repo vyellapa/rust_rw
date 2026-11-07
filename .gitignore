@@ -1,0 +1,12 @@
+**/target/
+**/__pycache__/
+*.py[cod]
+*.sif
+*.simg
+*.deb
+*.bundle
+*.bcf
+*.bcf.csi
+*.dump.gz
+*.log
+.DS_Store

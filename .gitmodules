@@ -1,0 +1,4 @@
+[submodule "delly/src/htslib"]
+	path = delly/src/htslib
+	url = https://github.com/samtools/htslib.git
+	ignore = dirty

@@ -1,0 +1,52 @@
+diff --git a/src/coverage.h b/src/coverage.h
+index e9f7214..f9f9dd1 100755
+--- a/src/coverage.h
++++ b/src/coverage.h
+@@ -28,6 +28,7 @@
+ #include "util.h"
+ #include "msa.h"
+ #include "split.h"
++#include "probeorder.h"
+ 
+ 
+ namespace torali {
+@@ -297,8 +298,9 @@ namespace torali {
+     // Clean-up
+     fai_destroy(fai);
+     for(int32_t refIndex=0; refIndex < (int32_t) hdr->n_targets; ++refIndex) {
+-      // Sort breakpoint regions
+-      std::sort(bpRegion[refIndex].begin(), bpRegion[refIndex].end());
++      // Restore serial collection order before the original (tie-sensitive) sort.
++      // Worker completion order must not affect genotypes or read-dump bytes.
++      sortProbeRegions(bpRegion[refIndex], svs);
+     }
+   }
+ 
+diff --git a/src/probeorder.h b/src/probeorder.h
+new file mode 100644
+--- /dev/null
++++ b/src/probeorder.h
+@@ -0,0 +1,23 @@
++#ifndef PROBEORDER_H
++#define PROBEORDER_H
++
++#include <algorithm>
++#include <tuple>
++
++namespace torali {
++
++  // Probe generation visits chromosomes, SV IDs, then breakpoint sides. Restore
++  // that serial insertion order after parallel collection, then use the original
++  // position-only std::sort. This preserves the single-threaded tie permutation.
++  template<typename TRegions, typename TSVs>
++  inline void sortProbeRegions(TRegions& regions, TSVs const& svs) {
++    std::sort(regions.begin(), regions.end(), [&](auto const& a, auto const& b) {
++      return std::make_tuple(svs[a.id].chr, a.id, a.bpPoint) <
++             std::make_tuple(svs[b.id].chr, b.id, b.bpPoint);
++    });
++    std::sort(regions.begin(), regions.end());
++  }
++
++}
++
++#endif
