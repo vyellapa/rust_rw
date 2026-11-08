@@ -395,6 +395,141 @@ fn dump_line(c: &Config, file_c: usize, fhdr: &Header, svt: i32, id: u32, rec: &
     )
 }
 
+/// Per-base yes/no mask at 1 bit per base (C++ uses one `bool` per base).
+struct BitSet(Vec<u64>);
+
+impl BitSet {
+    fn new(n: usize) -> Self {
+        BitSet(vec![0; n.div_ceil(64)])
+    }
+    #[inline]
+    fn set(&mut self, i: usize) {
+        self.0[i >> 6] |= 1 << (i & 63);
+    }
+    #[inline]
+    fn get(&self, i: usize) -> bool {
+        (self.0[i >> 6] >> (i & 63)) & 1 != 0
+    }
+}
+
+/// Saturation limit of the C++ uint16_t coverage counters (`maxCoverage - 1`).
+const COV_SATURATION: u16 = u16::MAX - 1;
+
+/// Half-open range summed by the C++ read-count loop
+/// `for (k = a; k < b && k < len; ++k)` with unsigned `k`; `None` when it is empty.
+fn rc_range(a: i32, b: i32, len: u32) -> Option<(u32, u32)> {
+    let (lo, hi) = (a as u32, (b as u32).min(len));
+    if lo < hi {
+        Some((lo, hi))
+    } else {
+        None
+    }
+}
+
+/// Left, middle and right read-count ranges of one SV, and whether it uses base coverage
+/// (small SVs) rather than fragment-midpoint coverage.
+fn rc_ranges(c: &Config, sv: &SVRecord, len: u32) -> (bool, [Option<(u32, u32)>; 3]) {
+    let mut small = false;
+    let mut half = (sv.sv_end - sv.sv_start) / 2;
+    let tra_or_ins = is_translocation(sv.svt) || sv.svt == 4;
+    if tra_or_ins {
+        half = 500;
+        small = true;
+    } else if (sv.sv_end - sv.sv_start) <= c.indelsize {
+        small = true;
+    }
+    let left = rc_range((sv.sv_start - half).max(0), sv.sv_start, len);
+    let mid = if tra_or_ins { rc_range((sv.sv_start - half).max(0), (sv.sv_start + half).min(len as i32), len) } else { rc_range(sv.sv_start, sv.sv_end, len) };
+    let right = if tra_or_ins { rc_range(sv.sv_start, (sv.sv_start + half).min(len as i32), len) } else { rc_range(sv.sv_end, (sv.sv_end + half).min(len as i32), len) };
+    (small, [left, mid, right])
+}
+
+/// Saturating per-base coverage, stored only inside the windows that are summed later
+/// (C++ keeps a uint16_t per base of the chromosome).
+struct WindowedCounts {
+    /// Sorted, disjoint windows: (start, end, offset into `counts`)
+    windows: Vec<(u32, u32, usize)>,
+    counts: Vec<u16>,
+}
+
+impl WindowedCounts {
+    fn new(mut ranges: Vec<(u32, u32)>) -> Self {
+        ranges.sort_unstable();
+        let mut windows: Vec<(u32, u32, usize)> = Vec::new();
+        let mut total = 0usize;
+        for (s, e) in ranges {
+            if let Some(last) = windows.last_mut() {
+                if s <= last.1 {
+                    if e > last.1 {
+                        total += (e - last.1) as usize;
+                        last.1 = e;
+                    }
+                    continue;
+                }
+            }
+            windows.push((s, e, total));
+            total += (e - s) as usize;
+        }
+        WindowedCounts { windows, counts: vec![0; total] }
+    }
+
+    /// Count one aligned base at every position of [start, end)
+    fn add(&mut self, start: u32, end: u32) {
+        let mut i = self.windows.partition_point(|w| w.1 <= start);
+        while i < self.windows.len() && self.windows[i].0 < end {
+            let (ws, we, off) = self.windows[i];
+            let (lo, hi) = (start.max(ws), end.min(we));
+            for v in &mut self.counts[off + (lo - ws) as usize..off + (hi - ws) as usize] {
+                if *v < COV_SATURATION {
+                    *v += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Sum over [lo, hi), which lies inside one window by construction
+    fn sum(&self, lo: u32, hi: u32) -> i32 {
+        let i = self.windows.partition_point(|w| w.1 <= lo);
+        let (ws, _, off) = self.windows[i];
+        self.counts[off + (lo - ws) as usize..off + (hi - ws) as usize].iter().fold(0i32, |s, &v| s.wrapping_add(v as i32))
+    }
+}
+
+/// Saturating fragment-midpoint coverage as sorted distinct positions with prefix sums
+/// (one entry per read pair instead of a uint16_t per base).
+struct MidpointCounts {
+    pos: Vec<u32>,
+    prefix: Vec<i64>,
+}
+
+impl MidpointCounts {
+    fn new(mut mids: Vec<u32>) -> Self {
+        mids.sort_unstable();
+        let mut pos = Vec::new();
+        let mut prefix = vec![0i64];
+        let mut i = 0;
+        while i < mids.len() {
+            let p = mids[i];
+            let mut j = i;
+            while j < mids.len() && mids[j] == p {
+                j += 1;
+            }
+            pos.push(p);
+            prefix.push(prefix[prefix.len() - 1] + (j - i).min(COV_SATURATION as usize) as i64);
+            i = j;
+        }
+        MidpointCounts { pos, prefix }
+    }
+
+    /// Sum over [lo, hi); the i64 difference truncated to i32 equals the C++ wrapping int32 sum
+    fn sum(&self, lo: u32, hi: u32) -> i32 {
+        let a = self.pos.partition_point(|&p| p < lo);
+        let b = self.pos.partition_point(|&p| p < hi);
+        (self.prefix[b] - self.prefix[a]) as i32
+    }
+}
+
 /// Scan one chromosome of one sample (runs in parallel)
 #[allow(clippy::too_many_arguments)]
 fn annotate_chrom(c: &Config, lib: &LibraryInfo, svs: &[SVRecord], pr: &Probes, hdr: &Header, file_c: usize, ref_index: i32) -> Option<ChromResult> {
@@ -405,32 +540,41 @@ fn annotate_chrom(c: &Config, lib: &LibraryInfo, svs: &[SVRecord], pr: &Probes, 
         return None;
     }
     let fhdr = Arc::new(bam.header.clone());
-    let max_cov: u32 = u16::MAX as u32;
     let mfs = c.minimum_flank_size;
     let mut events: Vec<Event> = Vec::new();
     let mut clip: HashMap<u64, (bool, u8)> = HashMap::new();
     let tlen = fhdr.lens[ref_index as usize];
-    let mut cov_fragment: Vec<u16> = vec![0; tlen as usize];
-    let mut cov_bases: Vec<u16> = vec![0; tlen as usize];
+    // Read-count ranges of the SVs on this chromosome: base coverage is only kept where it is summed.
+    let len0 = hdr.lens[ref_index as usize];
+    let sv_ranges: Vec<(usize, bool, [Option<(u32, u32)>; 3])> = svs
+        .iter()
+        .filter(|sv| sv.chr == ref_index)
+        .map(|sv| {
+            let (small, r) = rc_ranges(c, sv, len0);
+            (sv.id as usize, small, r)
+        })
+        .collect();
+    let mut cov_bases = WindowedCounts::new(sv_ranges.iter().filter(|s| s.1).flat_map(|s| s.2.iter().flatten().copied()).collect());
+    let mut mids: Vec<u32> = Vec::new();
     let regions = &pr.bp_region[ref_index as usize];
-    let mut bp_occupied = vec![false; tlen as usize];
+    let mut bp_occupied = BitSet::new(tlen as usize);
     for r in regions {
         for k in r.region_start..r.region_end {
-            bp_occupied[k as usize] = true;
+            bp_occupied.set(k as usize);
         }
     }
     let mut span_point: Vec<SpanPoint> = Vec::new();
-    let mut span_bp = vec![false; tlen as usize];
+    let mut span_bp = BitSet::new(tlen as usize);
     for sv in svs {
         if sv.pe_support == 0 {
             continue;
         }
         if sv.chr == ref_index && sv.sv_start < tlen as i32 {
-            span_bp[sv.sv_start as usize] = true;
+            span_bp.set(sv.sv_start as usize);
             span_point.push(SpanPoint { bppos: sv.sv_start, svt: sv.svt, id: sv.id as u32, chr2: sv.chr2, other_bppos: sv.sv_end });
         }
         if sv.chr2 == ref_index && sv.sv_end < tlen as i32 {
-            span_bp[sv.sv_end as usize] = true;
+            span_bp.set(sv.sv_end as usize);
             span_point.push(SpanPoint { bppos: sv.sv_end, svt: sv.svt, id: sv.id as u32, chr2: sv.chr, other_bppos: sv.sv_start });
         }
     }
@@ -451,13 +595,12 @@ fn annotate_chrom(c: &Config, lib: &LibraryInfo, svs: &[SVRecord], pr: &Probes, 
             for &cg in rec.cigar() {
                 let op = cigar_op(cg);
                 if op == BAM_CMATCH {
-                    for _ in 0..cigar_oplen(cg) {
-                        let p = pos + rp as i64;
-                        if p < tlen as i64 && (cov_bases[p as usize] as u32) < max_cov - 1 {
-                            cov_bases[p as usize] += 1;
-                        }
-                        rp += 1;
+                    let start = pos + rp as i64;
+                    let end = (start + cigar_oplen(cg) as i64).min(tlen as i64);
+                    if start < end {
+                        cov_bases.add(start as u32, end as u32);
                     }
+                    rp += cigar_oplen(cg);
                 } else if op == BAM_CDEL || op == BAM_CREF_SKIP {
                     rp += cigar_oplen(cg);
                 }
@@ -484,7 +627,7 @@ fn annotate_chrom(c: &Config, lib: &LibraryInfo, svs: &[SVRecord], pr: &Probes, 
             let mut bpvalid = false;
             let mut k = rbegin as i64;
             while k < pos + lq && k < tlen as i64 {
-                if bp_occupied[k as usize] {
+                if bp_occupied.get(k as usize) {
                     bpvalid = true;
                     break;
                 }
@@ -544,7 +687,7 @@ fn annotate_chrom(c: &Config, lib: &LibraryInfo, svs: &[SVRecord], pr: &Probes, 
                         pbegin = 0.max(pos as i32 + rec.l_qseq() - lib.max_normal_isize);
                         pend = (pos as i32 + rec.l_qseq()).min(tlen as i32);
                     }
-                    if (pbegin..pend).any(|i| span_bp[i as usize]) {
+                    if (pbegin..pend).any(|i| span_bp.get(i as usize)) {
                         let mut it = span_point.partition_point(|s| s.bppos < pbegin);
                         while it < span_point.len() && pend >= span_point[it].bppos {
                             let sp = span_point[it];
@@ -568,8 +711,8 @@ fn annotate_chrom(c: &Config, lib: &LibraryInfo, svs: &[SVRecord], pr: &Probes, 
             return true;
         }
         let mid = pos as i32 + half_alignment_length(rec) as i32;
-        if mid < tlen as i32 && (cov_fragment[mid as usize] as u32) < max_cov - 1 {
-            cov_fragment[mid as usize] += 1;
+        if mid < tlen as i32 {
+            mids.push(mid as u32);
         }
         let outer: i32 = if rec.pos() < rec.mpos() { (rec.mpos() + lq - rec.pos()) as i32 } else { (rec.pos() + lq - rec.mpos()) as i32 };
         if lib.median == 0 {
@@ -583,7 +726,7 @@ fn annotate_chrom(c: &Config, lib: &LibraryInfo, svs: &[SVRecord], pr: &Probes, 
             let mut valid = false;
             let mut i = st;
             while i < st + spanlen && i < tlen as i32 {
-                if span_bp[i as usize] {
+                if span_bp.get(i as usize) {
                     valid = true;
                     break;
                 }
@@ -608,7 +751,7 @@ fn annotate_chrom(c: &Config, lib: &LibraryInfo, svs: &[SVRecord], pr: &Probes, 
                 pbegin = 0.max(pos as i32 + rec.l_qseq() - lib.max_normal_isize);
                 pend = (pos as i32 + rec.l_qseq()).min(tlen as i32);
             }
-            if (pbegin..pend).any(|i| span_bp[i as usize]) {
+            if (pbegin..pend).any(|i| span_bp.get(i as usize)) {
                 let mut it = span_point.partition_point(|s| s.bppos < pbegin);
                 while it < span_point.len() && pend >= span_point[it].bppos {
                     let sp = span_point[it];
@@ -624,36 +767,18 @@ fn annotate_chrom(c: &Config, lib: &LibraryInfo, svs: &[SVRecord], pr: &Probes, 
     });
 
     // Assign fragment and base counts to SVs on this chromosome
-    let len0 = hdr.lens[ref_index as usize];
-    let mut rc: Vec<(usize, ReadCount)> = Vec::new();
-    for sv in svs {
-        if sv.chr != ref_index {
-            continue;
-        }
-        let mut small = false;
-        let mut half = (sv.sv_end - sv.sv_start) / 2;
-        if is_translocation(sv.svt) || sv.svt == 4 {
-            half = 500;
-            small = true;
-        } else if (sv.sv_end - sv.sv_start) <= c.indelsize {
-            small = true;
-        }
-        let sum = |a: i32, b: i32| -> i32 {
-            let mut s: i32 = 0;
-            let mut k = a as u32;
-            while k < b as u32 && k < len0 {
-                s = s.wrapping_add(if small { cov_bases[k as usize] as i32 } else { cov_fragment[k as usize] as i32 });
-                k += 1;
-            }
-            s
-        };
-        let left_rc = sum((sv.sv_start - half).max(0), sv.sv_start);
-        let (ms, me) = if is_translocation(sv.svt) || sv.svt == 4 { ((sv.sv_start - half).max(0), (sv.sv_start + half).min(len0 as i32)) } else { (sv.sv_start, sv.sv_end) };
-        let mid_rc = sum(ms, me);
-        let (rs, re) = if is_translocation(sv.svt) || sv.svt == 4 { (sv.sv_start, (sv.sv_start + half).min(len0 as i32)) } else { (sv.sv_end, (sv.sv_end + half).min(len0 as i32)) };
-        let right_rc = sum(rs, re);
-        rc.push((sv.id as usize, ReadCount { left_rc, rc: mid_rc, right_rc }));
-    }
+    let cov_fragment = MidpointCounts::new(mids);
+    let rc: Vec<(usize, ReadCount)> = sv_ranges
+        .iter()
+        .map(|&(id, small, ranges)| {
+            let [left_rc, rc, right_rc] = ranges.map(|r| match r {
+                None => 0,
+                Some((lo, hi)) if small => cov_bases.sum(lo, hi),
+                Some((lo, hi)) => cov_fragment.sum(lo, hi),
+            });
+            (id, ReadCount { left_rc, rc, right_rc })
+        })
+        .collect();
     Some(ChromResult { events, rc })
 }
 
@@ -922,6 +1047,42 @@ mod tests {
                 let labels: Vec<_> = text.lines().map(|line| line.split('\t').nth(2).unwrap_or(line)).collect();
                 assert_eq!(labels, ["SR1", "PE", "SR0", "TRA"]);
             }
+        }
+    }
+
+    #[test]
+    fn compact_coverage_matches_dense_arrays() {
+        let len = 5000u32;
+        let mut seed = 7u64;
+        let mut next = |m: u32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) % m as u64) as u32
+        };
+        // Overlapping, adjacent, empty and clipped ranges
+        let mut ranges: Vec<(i32, i32)> = (0..60).map(|_| (next(len + 200) as i32 - 100, next(len + 200) as i32 - 100)).collect();
+        ranges.extend([(0, 10), (10, 20), (2400, 2600), (2501, 2502), (4990, 6000), (-5, 3), (30, 30)]);
+        let wanted: Vec<(u32, u32)> = ranges.iter().filter_map(|&(a, b)| rc_range(a, b, len)).collect();
+        let mut dense = vec![0u16; len as usize];
+        let mut windowed = WindowedCounts::new(wanted.clone());
+        let mut dense_mid = vec![0u16; len as usize];
+        let mut mids = Vec::new();
+        // A hot spot exceeds the uint16_t saturation limit
+        for i in 0..70_000u32 {
+            let (s, l) = if i < 66_000 { (2500, 3) } else { (next(len), 1 + next(150)) };
+            let e = (s + l).min(len);
+            windowed.add(s, e);
+            for v in &mut dense[s as usize..e as usize] {
+                if *v < COV_SATURATION { *v += 1; }
+            }
+            let m = if i < 66_000 { 17 } else { next(len) };
+            mids.push(m);
+            if dense_mid[m as usize] < COV_SATURATION { dense_mid[m as usize] += 1; }
+        }
+        let mids = MidpointCounts::new(mids);
+        for &(lo, hi) in &wanted {
+            let sum = |d: &[u16]| d[lo as usize..hi as usize].iter().fold(0i32, |s, &v| s.wrapping_add(v as i32));
+            assert_eq!(windowed.sum(lo, hi), sum(&dense), "bases {}..{}", lo, hi);
+            assert_eq!(mids.sum(lo, hi), sum(&dense_mid), "midpoints {}..{}", lo, hi);
         }
     }
 
